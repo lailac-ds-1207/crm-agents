@@ -1,0 +1,61 @@
+# # Agent Framework
+# # langchain==0.3.25  
+# # langchain-core==0.3.65  
+# # langchain-google-genai==2.1.5
+# # langgraph==0.0.61
+# # google-generativeai==0.8.4
+
+# # Google Cloud
+# google-cloud-bigquery==3.30.0
+# google-cloud-storage==2.19.0
+# db-dtypes==1.4.3
+
+# # Web Application
+# streamlit==1.45.1
+# streamlit-chat==0.1.1
+
+# # Data Processing & Analysis
+# pandas==2.0.3
+# numpy==1.24.3
+# pyarrow==14.0.1
+
+# # Visualization
+# matplotlib==3.7.1
+# seaborn==0.12.2
+# plotly==5.18.0
+# kaleido==0.2.1  # For plotly static image export
+
+# # Machine Learning & Forecasting
+# scikit-learn==1.3.0
+# prophet==1.1.4
+# statsmodels==0.14.0
+# tensorflow==2.15.0  # Optional for deep learning forecasting
+
+# # PDF Generation
+# fpdf2==2.7.6
+# reportlab==4.0.8
+# pdfkit==1.0.0
+# weasyprint==60.2
+
+# # Utilities
+# python-dotenv==1.0.0
+# tqdm==4.66.1
+# pytz==2023.3
+
+streamlit>=1.22.0
+pandas>=1.5.0
+numpy>=1.23.0
+matplotlib>=3.6.0
+seaborn>=0.12.0
+plotly>=5.13.0
+google-cloud-bigquery>=3.9.0
+google-cloud-storage
+langchain>=0.0.267
+langchain-google-genai>=0.0.3
+langgraph>=0.0.20
+scikit-learn>=1.2.0
+prophet>=1.1.4
+statsmodels>=0.13.5
+fpdf2>=2.7.0
+Pillow>=9.4.0
+faker>=18.7.0
