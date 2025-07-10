@@ -4,7 +4,8 @@ This module defines the main class and interface for the customer segmentation f
 """
 import os
 import logging
-from typing import Dict, List, Any, Optional, Union, Tuple
+import re
+from typing import Dict, List, Any, Optional, Union, Tuple, Set
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
@@ -72,7 +73,69 @@ class SegmentationAgent:
             google_api_key=config.GEMINI_API_KEY,
         )
         
+        # Store valid table and column metadata
+        self.valid_tables = []
+        self.valid_columns = {}
+        self.column_types = {}
+        
+        # Cache schema metadata on initialization
+        self._cache_schema_metadata()
+        
         logger.info(f"Segmentation Agent initialized for dataset {self.dataset_id}")
+    
+    def _cache_schema_metadata(self) -> None:
+        """
+        Cache detailed schema metadata from BigQuery tables.
+        This helps prevent hallucinations by storing the actual table and column names.
+        """
+        logger.info("Caching schema metadata from BigQuery")
+        
+        # Define the tables we want to work with (from config)
+        table_ids = [
+            config.BQ_CUSTOMER_TABLE,
+            config.BQ_PRODUCT_TABLE,
+            config.BQ_OFFLINE_TRANSACTIONS_TABLE,
+            config.BQ_ONLINE_BEHAVIOR_TABLE
+        ]
+        
+        # Store valid table names (without dataset prefix)
+        self.valid_tables = table_ids.copy()
+        
+        # Initialize column collections
+        self.valid_columns = {table: set() for table in table_ids}
+        self.column_types = {}
+        
+        # Get schema for each table and cache column information
+        for table_id in table_ids:
+            try:
+                schema = self.bq_connector.get_table_schema(table_id)
+                
+                # Store column names and types for this table
+                for field in schema:
+                    column_name = field.get('name')
+                    column_type = field.get('type')
+                    
+                    if column_name and column_type:
+                        self.valid_columns[table_id].add(column_name)
+                        # Store as "table.column": type
+                        self.column_types[f"{table_id}.{column_name}"] = column_type
+                        
+                logger.info(f"Cached schema for {table_id}: {len(self.valid_columns[table_id])} columns")
+                
+            except Exception as e:
+                logger.error(f"Error caching schema for table {table_id}: {str(e)}")
+        
+        # Create a mapping of common aliases to full table names
+        self.table_aliases = {
+            "c": config.BQ_CUSTOMER_TABLE,
+            "p": config.BQ_PRODUCT_TABLE,
+            "t": config.BQ_OFFLINE_TRANSACTIONS_TABLE,
+            "ob": config.BQ_ONLINE_BEHAVIOR_TABLE,
+            "customer": config.BQ_CUSTOMER_TABLE,
+            "product": config.BQ_PRODUCT_TABLE,
+            "transaction": config.BQ_OFFLINE_TRANSACTIONS_TABLE,
+            "online": config.BQ_ONLINE_BEHAVIOR_TABLE
+        }
     
     def run(self, segmentation_request: str = None) -> str:
         """
@@ -128,26 +191,138 @@ class SegmentationAgent:
         logger.info(f"Converting text to SQL: {text_request}")
         
         # Get table schema information
-        customer_schema = self.bq_connector.get_table_schema(f"{self.dataset_id}.customer_master")
-        transaction_schema = self.bq_connector.get_table_schema(f"{self.dataset_id}.offline_transactions")
-        online_schema = self.bq_connector.get_table_schema(f"{self.dataset_id}.online_behavior")
-        product_schema = self.bq_connector.get_table_schema(f"{self.dataset_id}.product_master")
+        customer_schema = self.bq_connector.get_table_schema(config.BQ_CUSTOMER_TABLE)
+        transaction_schema = self.bq_connector.get_table_schema(config.BQ_OFFLINE_TRANSACTIONS_TABLE)
+        online_schema = self.bq_connector.get_table_schema(config.BQ_ONLINE_BEHAVIOR_TABLE)
+        product_schema = self.bq_connector.get_table_schema(config.BQ_PRODUCT_TABLE)
         
         # Format schema information for the prompt
         schema_info = f"""
         ## 테이블 스키마 정보
         
-        1. customer_master 테이블:
+        1. customer_master 테이블 (고객 정보):
         {self._format_schema(customer_schema)}
         
-        2. offline_transactions 테이블:
+        2. offline_transactions 테이블 (오프라인 거래 정보):
         {self._format_schema(transaction_schema)}
         
-        3. online_behavior 테이블:
+        3. online_behavior 테이블 (온라인 행동 정보):
         {self._format_schema(online_schema)}
         
-        4. product_master 테이블:
+        4. product_master 테이블 (제품 정보):
         {self._format_schema(product_schema)}
+        
+        ## 테이블 관계
+        - customer_master.customer_id = offline_transactions.customer_id
+        - customer_master.customer_id = online_behavior.customer_id
+        - offline_transactions.product_id = product_master.product_id
+        
+        ## 중요: 사용 가능한 테이블과 컬럼
+        - 위에 명시된 4개의 테이블과 컬럼만 사용할 수 있습니다.
+        - 존재하지 않는 테이블이나 컬럼을 참조하면 쿼리가 실패합니다.
+        - 각 테이블의 별칭은 다음과 같이 사용하세요: customer_master -> c, product_master -> p, offline_transactions -> t, online_behavior -> ob
+        """
+        
+        # Add example templates to help guide the model
+        example_templates = """
+        ## 예시 템플릿
+        
+        1. RFM 세그먼테이션:
+        ```sql
+        WITH rfm_data AS (
+            SELECT
+                c.customer_id,
+                DATE_DIFF(CURRENT_DATE(), MAX(PARSE_DATE('%Y-%m-%d', t.transaction_date)), DAY) as recency,
+                COUNT(DISTINCT t.transaction_id) as frequency,
+                SUM(t.total_amount) as monetary
+            FROM
+                `{dataset_id}.customer_master` c
+            LEFT JOIN
+                `{dataset_id}.offline_transactions` t
+            ON
+                c.customer_id = t.customer_id
+            GROUP BY
+                c.customer_id
+        ),
+        rfm_scores AS (
+            SELECT
+                customer_id,
+                recency,
+                frequency,
+                monetary,
+                CASE
+                    WHEN recency <= 30 THEN 3
+                    WHEN recency <= 90 THEN 2
+                    ELSE 1
+                END as r_score,
+                CASE
+                    WHEN frequency >= 10 THEN 3
+                    WHEN frequency >= 5 THEN 2
+                    ELSE 1
+                END as f_score,
+                CASE
+                    WHEN monetary >= 1000000 THEN 3
+                    WHEN monetary >= 500000 THEN 2
+                    ELSE 1
+                END as m_score
+            FROM
+                rfm_data
+        )
+        SELECT
+            rs.*,
+            CONCAT(
+                CASE WHEN r_score = 3 THEN 'H' WHEN r_score = 2 THEN 'M' ELSE 'L' END,
+                CASE WHEN f_score = 3 THEN 'H' WHEN f_score = 2 THEN 'M' ELSE 'L' END,
+                CASE WHEN m_score = 3 THEN 'H' WHEN m_score = 2 THEN 'M' ELSE 'L' END
+            ) as rfm_segment
+        FROM
+            rfm_scores rs
+        ```
+        
+        2. 라이프사이클 세그먼테이션:
+        ```sql
+        SELECT
+            c.customer_id,
+            c.registration_date,
+            DATE_DIFF(CURRENT_DATE(), PARSE_DATE('%Y-%m-%d', c.registration_date), DAY) as days_since_registration,
+            MAX(PARSE_DATE('%Y-%m-%d', t.transaction_date)) as last_purchase_date,
+            DATE_DIFF(CURRENT_DATE(), MAX(PARSE_DATE('%Y-%m-%d', t.transaction_date)), DAY) as days_since_last_purchase,
+            COUNT(DISTINCT t.transaction_id) as purchase_count,
+            CASE
+                WHEN DATE_DIFF(CURRENT_DATE(), PARSE_DATE('%Y-%m-%d', c.registration_date), DAY) <= 30 THEN '신규 고객'
+                WHEN DATE_DIFF(CURRENT_DATE(), MAX(PARSE_DATE('%Y-%m-%d', t.transaction_date)), DAY) <= 30 THEN '활성 고객'
+                WHEN DATE_DIFF(CURRENT_DATE(), MAX(PARSE_DATE('%Y-%m-%d', t.transaction_date)), DAY) <= 90 THEN '준활성 고객'
+                ELSE '휴면 고객'
+            END as lifecycle_segment
+        FROM
+            `{dataset_id}.customer_master` c
+        LEFT JOIN
+            `{dataset_id}.offline_transactions` t
+        ON
+            c.customer_id = t.customer_id
+        GROUP BY
+            c.customer_id, c.registration_date
+        ```
+        
+        3. 온라인 행동 분석:
+        ```sql
+        SELECT
+            c.customer_id,
+            COUNT(DISTINCT ob.session_id) as session_count,
+            MAX(PARSE_DATETIME('%Y-%m-%d %H:%M:%S', ob.event_timestamp)) as last_online_activity,
+            DATETIME_DIFF(CURRENT_DATETIME(), MAX(PARSE_DATETIME('%Y-%m-%d %H:%M:%S', ob.event_timestamp)), DAY) as days_since_last_activity,
+            COUNT(CASE WHEN ob.event_type = 'view_product' THEN 1 END) as product_views,
+            COUNT(CASE WHEN ob.event_type = 'add_to_cart' THEN 1 END) as add_to_carts,
+            COUNT(CASE WHEN ob.event_type = 'purchase' THEN 1 END) as online_purchases
+        FROM
+            `{dataset_id}.customer_master` c
+        JOIN
+            `{dataset_id}.online_behavior` ob
+        ON
+            c.customer_id = ob.customer_id
+        GROUP BY
+            c.customer_id
+        ```
         """
         
         # Create prompt for SQL generation
@@ -157,16 +332,38 @@ class SegmentationAgent:
         
         {schema_info}
         
+        {example_templates}
+        
         ## 자연어 요청
         {text_request}
         
-        다음 가이드라인을 따라주세요:
+        ## 중요 날짜 처리 가이드라인
+        1. 모든 날짜/타임스탬프 관련 컬럼은 STRING 타입으로 저장되어 있습니다.
+        2. 'YYYY-MM-DD' 형식의 날짜 문자열은 PARSE_DATE('%Y-%m-%d', column_name)을 사용하세요.
+        3. 'YYYY-MM-DD HH:MM:SS' 형식의 타임스탬프 문자열은 PARSE_DATETIME('%Y-%m-%d %H:%M:%S', column_name)을 사용하세요.
+        4. 날짜 비교는 DATE_DIFF() 함수를 사용하고, 타임스탬프 비교는 DATETIME_DIFF() 함수를 사용하세요.
+        5. 현재 날짜는 CURRENT_DATE()를, 현재 타임스탬프는 CURRENT_DATETIME()을 사용하세요.
+        
+        ## GROUP BY 가이드라인
+        1. GROUP BY 절을 사용할 때는 집계 함수(COUNT, SUM, MAX, MIN, AVG 등)로 감싸지 않은 모든 SELECT 컬럼을 GROUP BY에 포함해야 합니다.
+        2. 날짜 컬럼을 사용할 때는 특히 주의하세요. 예를 들어 t.transaction_date를 SELECT에서 사용한다면:
+           - GROUP BY에 t.transaction_date를 포함하거나
+           - MAX(t.transaction_date)나 MIN(t.transaction_date) 같은 집계 함수로 감싸야 합니다.
+        3. 날짜 계산(DATE_DIFF 등)을 사용할 때도 원본 날짜 컬럼을 GROUP BY에 포함하거나 집계 함수로 감싸야 합니다.
+        
+        ## 할루시네이션 방지 가이드라인
+        1. 스키마에 명시된 테이블과 컬럼만 사용하세요. 존재하지 않는 테이블이나 컬럼을 참조하지 마세요.
+        2. 사용 가능한 테이블: customer_master, product_master, offline_transactions, online_behavior
+        3. 각 테이블에 있는 컬럼만 참조하세요. 예를 들어, customer_master 테이블에 없는 컬럼을 customer_master에서 조회하지 마세요.
+        4. 테이블 별칭을 사용할 때는 일관성을 유지하세요: c (customer_master), p (product_master), t (offline_transactions), ob (online_behavior)
+        
+        ## 추가 가이드라인
         1. 쿼리는 BigQuery SQL 문법을 사용해야 합니다.
         2. 테이블 이름에는 데이터셋 ID를 포함해야 합니다 (예: `{self.dataset_id}.customer_master`).
         3. 쿼리 결과는 고객 ID(customer_id)와 관련 속성을 포함해야 합니다.
         4. 가능하면 세그먼트 이름이나 레이블을 포함하는 열을 생성해주세요.
         5. 쿼리 설명이나 주석 없이 SQL 쿼리만 제공해주세요.
-        6. yyyy-mm-dd 형태의 날짜나, timestamp처럼 보이는 컬럼들은 현재 STRING 타입입니다. 불필요한 PARSE_DATE를 하지 마세요.
+        6. 쿼리는 실행 가능하고 효율적이어야 합니다.
         """
         
         # Get SQL from LLM
@@ -176,12 +373,32 @@ class SegmentationAgent:
         # Clean up the SQL query (remove markdown formatting if present)
         if sql_query.startswith("```sql"):
             sql_query = sql_query.split("```sql")[1]
+        elif sql_query.startswith("```"):
+            sql_query = sql_query.split("```")[1]
+        
         if sql_query.endswith("```"):
             sql_query = sql_query.split("```")[0]
         
         sql_query = sql_query.strip()
         
-        print(sql_query)
+        # Apply date handling fixes
+        sql_query = self._fix_date_handling(sql_query)
+        
+        # Fix GROUP BY issues in the generated SQL
+        sql_query = self._fix_group_by_issues(sql_query)
+        
+        # Validate and fix hallucinated table and column references
+        hallucination_issues = self._validate_table_column_references(sql_query)
+        if hallucination_issues:
+            logger.warning(f"Detected hallucinated references: {hallucination_issues}")
+            sql_query = self._fix_hallucinated_references(sql_query)
+            
+            # If serious hallucination issues remain, regenerate the query
+            remaining_issues = self._validate_table_column_references(sql_query)
+            if remaining_issues:
+                logger.warning(f"Hallucination issues remain after fixing: {remaining_issues}")
+                sql_query = self._regenerate_query(text_request, 
+                                                 f"쿼리에 존재하지 않는 테이블 또는 컬럼이 포함되어 있습니다: {', '.join(remaining_issues)}")
         
         # Store the query
         self.queries[text_request] = sql_query
@@ -190,15 +407,587 @@ class SegmentationAgent:
         return sql_query
     
     def _format_schema(self, schema: List[Dict[str, Any]]) -> str:
-        """Format table schema for the prompt."""
+        """Format table schema for the prompt with enhanced type information."""
         if not schema:
             return "스키마 정보가 없습니다."
         
         formatted = []
         for field in schema:
-            formatted.append(f"- {field.get('name', 'unknown')}: {field.get('type', 'unknown')} - {field.get('description', '설명 없음')}")
+            name = field.get('name', 'unknown')
+            field_type = field.get('type', 'unknown')
+            description = field.get('description', '설명 없음')
+            
+            # Add more detailed type information for date/timestamp fields
+            type_info = field_type
+            if name in ["transaction_date", "registration_date", "birth_date", "join_date"]:
+                type_info = f"{field_type} (형식: YYYY-MM-DD)"
+            elif name in ["event_timestamp", "login_timestamp", "last_activity_timestamp"]:
+                type_info = f"{field_type} (형식: YYYY-MM-DD HH:MM:SS)"
+                
+            formatted.append(f"- {name}: {type_info} - {description}")
         
         return "\n".join(formatted)
+    
+    def _validate_table_column_references(self, sql_query: str) -> List[str]:
+        """
+        Validate table and column references in the SQL query.
+        
+        Args:
+            sql_query: SQL query to validate
+            
+        Returns:
+            List of hallucinated table or column references
+        """
+        hallucinated_references = []
+        
+        # Extract all table references (including aliases)
+        table_pattern = r'(?:FROM|JOIN)\s+`?' + self.dataset_id + r'\.([a-zA-Z0-9_]+)`?(?:\s+(?:AS\s+)?([a-zA-Z0-9_]+))?'
+        table_matches = re.finditer(table_pattern, sql_query, re.IGNORECASE)
+        
+        # Track tables and their aliases in this query
+        query_tables = {}
+        query_aliases = {}
+        
+        for match in table_matches:
+            table_name = match.group(1)
+            alias = match.group(2) if match.group(2) else table_name
+            
+            # Check if the table exists
+            if table_name not in self.valid_tables:
+                hallucinated_references.append(f"테이블 '{table_name}'")
+            else:
+                query_tables[alias] = table_name
+                query_aliases[table_name] = alias
+        
+        # Extract column references with table aliases
+        column_pattern = r'([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)'
+        column_matches = re.finditer(column_pattern, sql_query)
+        
+        for match in column_matches:
+            alias = match.group(1)
+            column = match.group(2)
+            
+            # Skip if it's not a table alias (might be a subquery alias)
+            if alias not in query_tables and alias not in self.table_aliases:
+                continue
+                
+            # Get the actual table name from the alias
+            table_name = query_tables.get(alias, self.table_aliases.get(alias))
+            
+            # If we can't resolve the table, skip
+            if not table_name:
+                continue
+                
+            # Check if the column exists in this table
+            if column not in self.valid_columns.get(table_name, set()):
+                hallucinated_references.append(f"컬럼 '{alias}.{column}'")
+        
+        return hallucinated_references
+    
+    def _fix_hallucinated_references(self, sql_query: str) -> str:
+        """
+        Fix hallucinated table and column references in the SQL query.
+        
+        Args:
+            sql_query: SQL query with potential hallucinations
+            
+        Returns:
+            Fixed SQL query
+        """
+        logger.info("Fixing hallucinated references in SQL query")
+        
+        # 1. Fix table references
+        # Map of common hallucinated table names to actual table names
+        table_corrections = {
+            "customers": "customer_master",
+            "products": "product_master",
+            "transactions": "offline_transactions",
+            "online_transactions": "online_behavior",
+            "online_activities": "online_behavior",
+            "customer": "customer_master",
+            "product": "product_master",
+            "transaction": "offline_transactions",
+            "online": "online_behavior"
+        }
+        
+        # Replace incorrect table names
+        for wrong, correct in table_corrections.items():
+            # Only replace if it's not already correct and is actually used as a table name
+            if wrong != correct and re.search(rf'(?:FROM|JOIN)\s+`?{self.dataset_id}\.{wrong}`?', sql_query, re.IGNORECASE):
+                sql_query = re.sub(
+                    rf'(?:FROM|JOIN)\s+`?{self.dataset_id}\.{wrong}`?', 
+                    f' FROM `{self.dataset_id}.{correct}`', 
+                    sql_query, 
+                    flags=re.IGNORECASE
+                )
+        
+        # 2. Fix column references
+        # Map of common hallucinated column names to actual column names per table
+        column_corrections = {
+            "customer_master": {
+                "birth_day": "birth_date",
+                "registration_day": "registration_date",
+                "signup_date": "registration_date",
+                "gender_code": "gender",
+                "age_group": "age_range"
+            },
+            "offline_transactions": {
+                "purchase_date": "transaction_date",
+                "amount": "total_amount",
+                "transaction_amount": "total_amount",
+                "purchase_amount": "total_amount"
+            },
+            "online_behavior": {
+                "timestamp": "event_timestamp",
+                "activity_timestamp": "event_timestamp",
+                "session": "session_id",
+                "activity_type": "event_type"
+            },
+            "product_master": {
+                "category": "category_level_1",
+                "subcategory": "category_level_2",
+                "product_category": "category_level_1",
+                "product_subcategory": "category_level_2"
+            }
+        }
+        
+        # Extract all table aliases from the query
+        alias_pattern = r'(?:FROM|JOIN)\s+`?' + self.dataset_id + r'\.([a-zA-Z0-9_]+)`?(?:\s+(?:AS\s+)?([a-zA-Z0-9_]+))?'
+        alias_matches = re.finditer(alias_pattern, sql_query, re.IGNORECASE)
+        
+        table_aliases = {}
+        for match in alias_matches:
+            table_name = match.group(1)
+            alias = match.group(2) if match.group(2) else table_name
+            table_aliases[alias] = table_name
+            
+            # Also handle corrected table names
+            for wrong, correct in table_corrections.items():
+                if table_name == wrong:
+                    table_aliases[alias] = correct
+        
+        # Replace incorrect column names
+        for alias, table in table_aliases.items():
+            if table in column_corrections:
+                for wrong, correct in column_corrections[table].items():
+                    # Pattern to match the wrong column with this alias
+                    pattern = rf'{alias}\.{wrong}\b'
+                    if re.search(pattern, sql_query, re.IGNORECASE):
+                        sql_query = re.sub(pattern, f'{alias}.{correct}', sql_query, flags=re.IGNORECASE)
+        
+        logger.info("Hallucinated reference fixes applied to SQL query")
+        return sql_query
+    
+    def _regenerate_query(self, text_request: str, error_message: str) -> str:
+        """
+        Regenerate SQL query with additional guidance.
+        
+        Args:
+            text_request: Original natural language request
+            error_message: Error message to guide regeneration
+            
+        Returns:
+            Regenerated SQL query
+        """
+        logger.info(f"Regenerating query with guidance: {error_message}")
+        
+        # Get table schema information
+        customer_schema = self.bq_connector.get_table_schema(config.BQ_CUSTOMER_TABLE)
+        transaction_schema = self.bq_connector.get_table_schema(config.BQ_OFFLINE_TRANSACTIONS_TABLE)
+        online_schema = self.bq_connector.get_table_schema(config.BQ_ONLINE_BEHAVIOR_TABLE)
+        product_schema = self.bq_connector.get_table_schema(config.BQ_PRODUCT_TABLE)
+        
+        # Format schema information for the prompt
+        schema_info = f"""
+        ## 테이블 스키마 정보
+        
+        1. customer_master 테이블 (고객 정보):
+        {self._format_schema(customer_schema)}
+        
+        2. offline_transactions 테이블 (오프라인 거래 정보):
+        {self._format_schema(transaction_schema)}
+        
+        3. online_behavior 테이블 (온라인 행동 정보):
+        {self._format_schema(online_schema)}
+        
+        4. product_master 테이블 (제품 정보):
+        {self._format_schema(product_schema)}
+        
+        ## 테이블 관계
+        - customer_master.customer_id = offline_transactions.customer_id
+        - customer_master.customer_id = online_behavior.customer_id
+        - offline_transactions.product_id = product_master.product_id
+        
+        ## 중요: 사용 가능한 테이블과 컬럼
+        - 위에 명시된 4개의 테이블과 컬럼만 사용할 수 있습니다.
+        - 존재하지 않는 테이블이나 컬럼을 참조하면 쿼리가 실패합니다.
+        - 각 테이블의 별칭은 다음과 같이 사용하세요: customer_master -> c, product_master -> p, offline_transactions -> t, online_behavior -> ob
+        """
+        
+        # Create prompt with error guidance
+        prompt = f"""
+        당신은 가전 리테일 업체의 CDP 시스템에서 고객 세그먼테이션을 위한 SQL 쿼리를 생성하는 전문가입니다.
+        다음 테이블 스키마 정보와 자연어 요청을 바탕으로 BigQuery SQL 쿼리를 작성해주세요.
+        
+        {schema_info}
+        
+        ## 자연어 요청
+        {text_request}
+        
+        ## 이전 쿼리의 문제점
+        {error_message}
+        
+        ## 중요 날짜 처리 가이드라인
+        1. 모든 날짜/타임스탬프 관련 컬럼은 STRING 타입으로 저장되어 있습니다.
+        2. 'YYYY-MM-DD' 형식의 날짜 문자열은 PARSE_DATE('%Y-%m-%d', column_name)을 사용하세요.
+        3. 'YYYY-MM-DD HH:MM:SS' 형식의 타임스탬프 문자열은 PARSE_DATETIME('%Y-%m-%d %H:%M:%S', column_name)을 사용하세요.
+        4. 날짜 비교는 DATE_DIFF() 함수를 사용하고, 타임스탬프 비교는 DATETIME_DIFF() 함수를 사용하세요.
+        
+        ## GROUP BY 가이드라인
+        1. GROUP BY 절을 사용할 때는 집계 함수(COUNT, SUM, MAX, MIN, AVG 등)로 감싸지 않은 모든 SELECT 컬럼을 GROUP BY에 포함해야 합니다.
+        2. 날짜 컬럼을 사용할 때는 특히 주의하세요. 예를 들어 t.transaction_date를 SELECT에서 사용한다면:
+           - GROUP BY에 t.transaction_date를 포함하거나
+           - MAX(t.transaction_date)나 MIN(t.transaction_date) 같은 집계 함수로 감싸야 합니다.
+        
+        ## 할루시네이션 방지 가이드라인
+        1. 스키마에 명시된 테이블과 컬럼만 사용하세요. 존재하지 않는 테이블이나 컬럼을 참조하지 마세요.
+        2. 사용 가능한 테이블: customer_master, product_master, offline_transactions, online_behavior
+        3. 각 테이블에 있는 컬럼만 참조하세요. 예를 들어, customer_master 테이블에 없는 컬럼을 customer_master에서 조회하지 마세요.
+        4. 테이블 별칭을 사용할 때는 일관성을 유지하세요: c (customer_master), p (product_master), t (offline_transactions), ob (online_behavior)
+        
+        ## 추가 가이드라인
+        1. 쿼리는 BigQuery SQL 문법을 사용해야 합니다.
+        2. 테이블 이름에는 데이터셋 ID를 포함해야 합니다 (예: `{self.dataset_id}.customer_master`).
+        3. 쿼리 결과는 반드시 고객 ID(customer_id)와 관련 속성을 포함해야 합니다.
+        4. 가능하면 세그먼트 이름이나 레이블을 포함하는 열을 생성해주세요.
+        5. 쿼리 설명이나 주석 없이 SQL 쿼리만 제공해주세요.
+        6. INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, TRUNCATE와 같은 데이터 수정 문은 사용하지 마세요.
+        7. 쿼리는 실행 가능하고 효율적이어야 합니다.
+        """
+        
+        # Get SQL from LLM
+        response = self.llm.invoke([HumanMessage(content=prompt)])
+        sql_query = response.content.strip()
+        
+        # Clean up the SQL query
+        if sql_query.startswith("```sql"):
+            sql_query = sql_query.split("```sql")[1]
+        elif sql_query.startswith("```"):
+            sql_query = sql_query.split("```")[1]
+        
+        if sql_query.endswith("```"):
+            sql_query = sql_query.split("```")[0]
+        
+        sql_query = sql_query.strip()
+        
+        # Fix date handling in the regenerated SQL
+        sql_query = self._fix_date_handling(sql_query)
+        
+        # Fix GROUP BY issues in the regenerated SQL
+        sql_query = self._fix_group_by_issues(sql_query)
+        
+        # Fix hallucinated references
+        sql_query = self._fix_hallucinated_references(sql_query)
+        
+        return sql_query
+    
+    def _fix_date_handling(self, sql_query: str) -> str:
+        """
+        Fix date handling in the generated SQL query.
+        
+        Args:
+            sql_query: Generated SQL query
+            
+        Returns:
+            SQL query with fixed date handling
+        """
+        logger.info("Fixing date handling in SQL query")
+        
+        # Fix patterns for simple date strings (YYYY-MM-DD)
+        # Pattern: PARSE_DATETIME('%Y-%m-%d', date_column) -> PARSE_DATE('%Y-%m-%d', date_column)
+        simple_date_pattern = r"PARSE_DATETIME\('%Y-%m-%d',\s*([^)]+)\)"
+        sql_query = re.sub(simple_date_pattern, r"PARSE_DATE('%Y-%m-%d', \1)", sql_query)
+        
+        # Fix patterns for date columns with time component in column name but actually just dates
+        date_columns = ["transaction_date", "registration_date", "birth_date", "join_date"]
+        for col in date_columns:
+            # Pattern: PARSE_DATETIME('%Y-%m-%d %H:%M:%S', date_column) -> PARSE_DATE('%Y-%m-%d', date_column)
+            pattern = fr"PARSE_DATETIME\('%Y-%m-%d %H:%M:%S',\s*([^)]*{col}[^)]*)\)"
+            sql_query = re.sub(pattern, fr"PARSE_DATE('%Y-%m-%d', \1)", sql_query)
+        
+        # Fix patterns for timestamp strings (YYYY-MM-DD HH:MM:SS)
+        timestamp_columns = ["event_timestamp", "login_timestamp", "last_activity_timestamp"]
+        for col in timestamp_columns:
+            # Ensure PARSE_DATETIME is used for actual timestamp columns
+            pattern = fr"PARSE_DATE\('%Y-%m-%d',\s*([^)]*{col}[^)]*)\)"
+            sql_query = re.sub(pattern, fr"PARSE_DATETIME('%Y-%m-%d %H:%M:%S', \1)", sql_query)
+        
+        # Fix DATETIME_DIFF vs DATE_DIFF usage
+        # Replace DATE_DIFF with DATETIME_DIFF when comparing DATETIME values
+        datetime_diff_pattern = r"DATE_DIFF\(CURRENT_DATE\(\),\s*PARSE_DATETIME\("
+        sql_query = re.sub(datetime_diff_pattern, r"DATETIME_DIFF(CURRENT_DATETIME(), PARSE_DATETIME(", sql_query)
+        
+        # Replace DATETIME_DIFF with DATE_DIFF when comparing DATE values
+        date_diff_pattern = r"DATETIME_DIFF\(CURRENT_DATETIME\(\),\s*PARSE_DATE\("
+        sql_query = re.sub(date_diff_pattern, r"DATE_DIFF(CURRENT_DATE(), PARSE_DATE(", sql_query)
+        
+        # Fix comparison between CURRENT_DATETIME and dates
+        current_datetime_pattern = r"PARSE_DATE\('%Y-%m-%d',\s*([^)]+)\)\s*([<>=]+)\s*CURRENT_DATETIME\(\)"
+        sql_query = re.sub(current_datetime_pattern, r"PARSE_DATE('%Y-%m-%d', \1) \2 CURRENT_DATE()", sql_query)
+        
+        # Fix comparison between CURRENT_DATE and timestamps
+        current_date_pattern = r"PARSE_DATETIME\('%Y-%m-%d %H:%M:%S',\s*([^)]+)\)\s*([<>=]+)\s*CURRENT_DATE\(\)"
+        sql_query = re.sub(current_date_pattern, r"PARSE_DATETIME('%Y-%m-%d %H:%M:%S', \1) \2 CURRENT_DATETIME()", sql_query)
+        
+        logger.info("Date handling fixes applied to SQL query")
+        return sql_query
+    
+    def _fix_group_by_issues(self, sql_query: str) -> str:
+        """
+        Fix GROUP BY issues in the generated SQL query.
+        
+        Args:
+            sql_query: Generated SQL query
+            
+        Returns:
+            SQL query with fixed GROUP BY issues
+        """
+        logger.info("Fixing GROUP BY issues in SQL query")
+        
+        # If there's no GROUP BY, nothing to fix
+        if "GROUP BY" not in sql_query.upper():
+            return sql_query
+        
+        # Extract the main parts of the query
+        try:
+            # Split query into parts before and after GROUP BY
+            before_group_by, after_group_by = re.split(r'GROUP\s+BY', sql_query, flags=re.IGNORECASE, maxsplit=1)
+            
+            # Extract SELECT clause
+            select_match = re.search(r'SELECT\s+(.*?)(?:FROM|$)', before_group_by, re.IGNORECASE | re.DOTALL)
+            if not select_match:
+                logger.warning("Could not parse SELECT clause for GROUP BY fixing")
+                return sql_query
+                
+            select_clause = select_match.group(1).strip()
+            
+            # Extract GROUP BY columns
+            group_by_clause = after_group_by.strip()
+            # Handle cases where there's more SQL after GROUP BY (HAVING, ORDER BY, etc.)
+            group_by_end = re.search(r'(HAVING|ORDER\s+BY|LIMIT|;|$)', group_by_clause, re.IGNORECASE)
+            if group_by_end:
+                group_by_end_pos = group_by_end.start()
+                rest_of_query = group_by_clause[group_by_end_pos:]
+                group_by_clause = group_by_clause[:group_by_end_pos].strip()
+            else:
+                rest_of_query = ""
+            
+            # Parse SELECT columns
+            select_columns = []
+            current_column = ""
+            paren_level = 0
+            
+            for char in select_clause:
+                if char == ',' and paren_level == 0:
+                    select_columns.append(current_column.strip())
+                    current_column = ""
+                else:
+                    current_column += char
+                    if char == '(':
+                        paren_level += 1
+                    elif char == ')':
+                        paren_level -= 1
+            
+            if current_column.strip():
+                select_columns.append(current_column.strip())
+            
+            # Parse GROUP BY columns
+            group_by_columns = [col.strip() for col in group_by_clause.split(',')]
+            
+            # Check each SELECT column to see if it needs to be in GROUP BY
+            columns_to_add = []
+            date_columns_to_fix = []
+            
+            for col in select_columns:
+                # Skip columns that are already aggregated
+                if re.search(r'(COUNT|SUM|AVG|MAX|MIN|ARRAY_AGG|STRING_AGG)\s*\(', col, re.IGNORECASE):
+                    continue
+                
+                # Skip columns that are aliases to aggregated expressions
+                if ' as ' in col.lower() and re.search(r'(COUNT|SUM|AVG|MAX|MIN|ARRAY_AGG|STRING_AGG)\s*\(', 
+                                                     col.lower().split(' as ')[0], re.IGNORECASE):
+                    continue
+                
+                # Extract column name (without alias)
+                col_name = col.split(' as ')[0].strip() if ' as ' in col.lower() else col
+                
+                # Check if column is in GROUP BY
+                if not any(col_name == group_col for group_col in group_by_columns):
+                    # Special handling for date columns - wrap in MAX() instead of adding to GROUP BY
+                    date_column_match = re.search(r'([a-zA-Z0-9_.]+\.(transaction_date|registration_date|birth_date|join_date|event_timestamp|login_timestamp|last_activity_timestamp))', col_name)
+                    if date_column_match:
+                        date_columns_to_fix.append((col, date_column_match.group(1)))
+                    else:
+                        # For other columns, add to GROUP BY
+                        columns_to_add.append(col_name)
+            
+            # Fix the query if needed
+            if columns_to_add or date_columns_to_fix:
+                # Fix date columns by wrapping in MAX()
+                modified_select_clause = select_clause
+                for col, date_col in date_columns_to_fix:
+                    # Replace the date column with MAX(date_column)
+                    # Only replace exact matches to avoid partial replacements
+                    pattern = r'(?<!\w)' + re.escape(date_col) + r'(?!\w)'
+                    modified_select_clause = re.sub(pattern, f"MAX({date_col})", modified_select_clause)
+                
+                # Rebuild the query with modified SELECT and extended GROUP BY
+                modified_before_group_by = before_group_by.replace(select_clause, modified_select_clause)
+                
+                if columns_to_add:
+                    extended_group_by = group_by_clause + ", " + ", ".join(columns_to_add)
+                    modified_query = f"{modified_before_group_by} GROUP BY {extended_group_by} {rest_of_query}"
+                else:
+                    modified_query = f"{modified_before_group_by} GROUP BY {group_by_clause} {rest_of_query}"
+                
+                logger.info("Fixed GROUP BY issues in query")
+                return modified_query
+            
+            # No issues to fix
+            return sql_query
+            
+        except Exception as e:
+            logger.error(f"Error fixing GROUP BY issues: {str(e)}")
+            # Return original query if there was an error in the fixing process
+            return sql_query
+    
+    def _check_date_handling_issues(self, sql_query: str) -> str:
+        """
+        Check for potential date handling issues in the SQL query.
+        
+        Args:
+            sql_query: SQL query to check
+            
+        Returns:
+            String describing issues found, or empty string if no issues
+        """
+        issues = []
+        
+        # Check for PARSE_DATETIME used with date columns
+        date_columns = ["transaction_date", "registration_date", "birth_date", "join_date"]
+        for col in date_columns:
+            if f"PARSE_DATETIME('%Y-%m-%d %H:%M:%S', {col})" in sql_query:
+                issues.append(f"{col}은 날짜 형식(YYYY-MM-DD)이므로 PARSE_DATE를 사용해야 합니다.")
+        
+        # Check for PARSE_DATE used with timestamp columns
+        timestamp_columns = ["event_timestamp", "login_timestamp", "last_activity_timestamp"]
+        for col in timestamp_columns:
+            if f"PARSE_DATE('%Y-%m-%d', {col})" in sql_query:
+                issues.append(f"{col}은 타임스탬프 형식(YYYY-MM-DD HH:MM:SS)이므로 PARSE_DATETIME을 사용해야 합니다.")
+        
+        # Check for mismatched date comparisons
+        if "PARSE_DATE" in sql_query and "CURRENT_DATETIME()" in sql_query:
+            if re.search(r"PARSE_DATE\([^)]+\)\s*[<>=]+\s*CURRENT_DATETIME\(\)", sql_query):
+                issues.append("PARSE_DATE 결과를 CURRENT_DATETIME()과 비교하고 있습니다. CURRENT_DATE()를 사용하세요.")
+        
+        if "PARSE_DATETIME" in sql_query and "CURRENT_DATE()" in sql_query:
+            if re.search(r"PARSE_DATETIME\([^)]+\)\s*[<>=]+\s*CURRENT_DATE\(\)", sql_query):
+                issues.append("PARSE_DATETIME 결과를 CURRENT_DATE()와 비교하고 있습니다. CURRENT_DATETIME()을 사용하세요.")
+        
+        # Check for mismatched diff functions
+        if "DATE_DIFF" in sql_query and "PARSE_DATETIME" in sql_query:
+            if re.search(r"DATE_DIFF\([^,]+,\s*PARSE_DATETIME\(", sql_query):
+                issues.append("PARSE_DATETIME 결과에 DATE_DIFF를 사용하고 있습니다. DATETIME_DIFF를 사용하세요.")
+        
+        if "DATETIME_DIFF" in sql_query and "PARSE_DATE" in sql_query:
+            if re.search(r"DATETIME_DIFF\([^,]+,\s*PARSE_DATE\(", sql_query):
+                issues.append("PARSE_DATE 결과에 DATETIME_DIFF를 사용하고 있습니다. DATE_DIFF를 사용하세요.")
+        
+        return "; ".join(issues)
+    
+    def _check_group_by_issues(self, sql_query: str) -> str:
+        """
+        Check for potential GROUP BY issues in the SQL query.
+        
+        Args:
+            sql_query: SQL query to check
+            
+        Returns:
+            String describing issues found, or empty string if no issues
+        """
+        issues = []
+        
+        # If there's no GROUP BY, nothing to check
+        if "GROUP BY" not in sql_query.upper():
+            return ""
+        
+        try:
+            # Split query into parts before and after GROUP BY
+            before_group_by, after_group_by = re.split(r'GROUP\s+BY', sql_query, flags=re.IGNORECASE, maxsplit=1)
+            
+            # Extract SELECT clause
+            select_match = re.search(r'SELECT\s+(.*?)(?:FROM|$)', before_group_by, re.IGNORECASE | re.DOTALL)
+            if not select_match:
+                return "SELECT 절을 파싱할 수 없습니다."
+                
+            select_clause = select_match.group(1).strip()
+            
+            # Extract GROUP BY columns
+            group_by_clause = after_group_by.strip()
+            # Handle cases where there's more SQL after GROUP BY
+            group_by_end = re.search(r'(HAVING|ORDER\s+BY|LIMIT|;|$)', group_by_clause, re.IGNORECASE)
+            if group_by_end:
+                group_by_clause = group_by_clause[:group_by_end.start()].strip()
+            
+            # Parse SELECT columns
+            select_columns = []
+            current_column = ""
+            paren_level = 0
+            
+            for char in select_clause:
+                if char == ',' and paren_level == 0:
+                    select_columns.append(current_column.strip())
+                    current_column = ""
+                else:
+                    current_column += char
+                    if char == '(':
+                        paren_level += 1
+                    elif char == ')':
+                        paren_level -= 1
+            
+            if current_column.strip():
+                select_columns.append(current_column.strip())
+            
+            # Parse GROUP BY columns
+            group_by_columns = [col.strip() for col in group_by_clause.split(',')]
+            
+            # Check each SELECT column to see if it needs to be in GROUP BY
+            for col in select_columns:
+                # Skip columns that are already aggregated
+                if re.search(r'(COUNT|SUM|AVG|MAX|MIN|ARRAY_AGG|STRING_AGG)\s*\(', col, re.IGNORECASE):
+                    continue
+                
+                # Skip columns that are aliases to aggregated expressions
+                if ' as ' in col.lower() and re.search(r'(COUNT|SUM|AVG|MAX|MIN|ARRAY_AGG|STRING_AGG)\s*\(', 
+                                                     col.lower().split(' as ')[0], re.IGNORECASE):
+                    continue
+                
+                # Extract column name (without alias)
+                col_name = col.split(' as ')[0].strip() if ' as ' in col.lower() else col
+                
+                # Check if column is in GROUP BY
+                if not any(col_name == group_col for group_col in group_by_columns):
+                    # Special check for date columns
+                    date_column_match = re.search(r'([a-zA-Z0-9_.]+\.(transaction_date|registration_date|birth_date|join_date|event_timestamp|login_timestamp|last_activity_timestamp))', col_name)
+                    if date_column_match:
+                        issues.append(f"{date_column_match.group(1)}은(는) GROUP BY에 포함되어 있지 않고 집계 함수로 감싸져 있지도 않습니다. MAX() 함수로 감싸거나 GROUP BY에 추가하세요.")
+                    else:
+                        issues.append(f"{col_name}은(는) GROUP BY에 포함되어 있지 않고 집계 함수로 감싸져 있지도 않습니다.")
+            
+            return "; ".join(issues)
+            
+        except Exception as e:
+            return f"GROUP BY 이슈 확인 중 오류 발생: {str(e)}"
     
     def execute_query(self, sql_query: str) -> pd.DataFrame:
         """
@@ -241,7 +1030,26 @@ class SegmentationAgent:
         if "customer_id" not in sql_query.lower():
             raise ValueError("Query must include customer_id column")
         
-        # Additional validation could be added here
+        # Check for date handling issues
+        date_issues = self._check_date_handling_issues(sql_query)
+        if date_issues:
+            logger.warning(f"Date handling issues found in query: {date_issues}")
+            # Note: We're not raising an error here, just logging a warning,
+            # since the _fix_date_handling method should have addressed these issues
+        
+        # Check for potential GROUP BY issues
+        group_by_issues = self._check_group_by_issues(sql_query)
+        if group_by_issues:
+            logger.warning(f"GROUP BY issues found in query: {group_by_issues}")
+            # Note: We're not raising an error here, just logging a warning,
+            # since the _fix_group_by_issues method should have addressed these issues
+        
+        # Check for hallucinated references
+        hallucination_issues = self._validate_table_column_references(sql_query)
+        if hallucination_issues:
+            logger.warning(f"Hallucination issues found in query: {', '.join(hallucination_issues)}")
+            # Note: We're not raising an error here, just logging a warning,
+            # since the _fix_hallucinated_references method should have addressed these issues
         
         logger.info("SQL query validation passed")
     
@@ -254,7 +1062,7 @@ class SegmentationAgent:
         WITH rfm_data AS (
             SELECT
                 c.customer_id,
-                DATETIME_DIFF(CURRENT_DATETIME(), MAX(PARSE_DATETIME('%Y-%m-%d %H:%M:%S', t.transaction_date)), DAY) as recency,
+                DATE_DIFF(CURRENT_DATE(), MAX(PARSE_DATE('%Y-%m-%d', t.transaction_date)), DAY) as recency,
                 COUNT(DISTINCT t.transaction_id) as frequency,
                 SUM(t.total_amount) as monetary
             FROM
@@ -309,6 +1117,8 @@ class SegmentationAgent:
             rfm_scores rs
         """
         
+        # Apply date handling fixes to default queries
+        rfm_query = self._fix_date_handling(rfm_query)
         rfm_segments = self.execute_query(rfm_query)
         self.segments["rfm"] = rfm_segments
         
@@ -318,10 +1128,10 @@ class SegmentationAgent:
             SELECT
                 c.customer_id,
                 c.registration_date,
-                DATETIME_DIFF(CURRENT_DATETIME(), PARSE_DATETIME('%Y-%m-%d', c.registration_date), DAY) as days_since_registration,
                 DATE_DIFF(CURRENT_DATE(), PARSE_DATE('%Y-%m-%d', c.registration_date), DAY) as days_since_registration,
-                DATETIME_DIFF(CURRENT_DATETIME(), MAX(PARSE_DATETIME('%Y-%m-%d %H:%M:%S', t.transaction_date)), DAY) as days_since_last_purchase,
-                DATE_DIFF(CURRENT_DATE(), DATE(MAX(PARSE_DATETIME('%Y-%m-%d %H:%M:%S', t.transaction_date))), DAY) as days_since_last_purchase,
+                MAX(PARSE_DATE('%Y-%m-%d', t.transaction_date)) as last_purchase_date,
+                DATE_DIFF(CURRENT_DATE(), MAX(PARSE_DATE('%Y-%m-%d', t.transaction_date)), DAY) as days_since_last_purchase,
+                COUNT(DISTINCT t.transaction_id) as purchase_count,
                 COUNT(DISTINCT ob.session_id) as online_sessions
             FROM
                 `{self.dataset_id}.customer_master` c
@@ -350,6 +1160,7 @@ class SegmentationAgent:
             customer_activity ca
         """
         
+        lifecycle_query = self._fix_date_handling(lifecycle_query)
         lifecycle_segments = self.execute_query(lifecycle_query)
         self.segments["lifecycle"] = lifecycle_segments
         
@@ -684,539 +1495,179 @@ class SegmentationAgent:
             elif segment_type == "category":
                 segment_col = "category_segment"
             elif segment_type == "custom":
-                # Try to find a column that might contain segment information
-                potential_cols = [col for col in segment_data.columns if "segment" in col.lower()]
-                if potential_cols:
-                    segment_col = potential_cols[0]
-            
-            # Skip if no segment column found
-            if not segment_col or segment_col not in segment_data.columns:
-                logger.warning(f"No segment column found for {segment_type}")
-                continue
-            
-            # Create pie chart for segment distribution
-            segment_counts = segment_data[segment_col].value_counts()
-            
-            fig_pie = create_pie_chart(
-                values=segment_counts.values,
-                labels=segment_counts.index,
-                title=f"{segment_type.upper()} 세그먼트 분포",
-                use_plotly=True
-            )
-            
-            pie_path = save_plotly_fig(fig_pie, f"{segment_type}_segment_distribution.png")
-            
-            self.visualizations.append({
-                "path": pie_path,
-                "title": f"{segment_type.upper()} 세그먼트 분포",
-                "description": f"{segment_type} 세그먼테이션 결과의 고객 분포를 보여줍니다.",
-                "segment_type": segment_type
-            })
-            
-            # Create additional visualizations based on segment type
-            if segment_type == "rfm":
-                # Create bar charts for R, F, M metrics by segment
-                if all(col in segment_data.columns for col in ["segment_name", "recency", "frequency", "monetary"]):
-                    # Recency by segment
-                    recency_by_segment = segment_data.groupby("segment_name")["recency"].mean().sort_values()
-                    
-                    fig_recency = create_bar_chart(
-                        x=recency_by_segment.index,
-                        y=recency_by_segment.values,
-                        title="세그먼트별 평균 최근성(Recency)",
-                        xlabel="세그먼트",
-                        ylabel="평균 최근성(일)",
-                        use_plotly=True
-                    )
-                    
-                    recency_path = save_plotly_fig(fig_recency, "rfm_recency_by_segment.png")
-                    
-                    self.visualizations.append({
-                        "path": recency_path,
-                        "title": "세그먼트별 평균 최근성(Recency)",
-                        "description": "각 RFM 세그먼트의 평균 최근성(마지막 구매 후 경과일)을 보여줍니다.",
-                        "segment_type": segment_type
-                    })
-                    
-                    # Frequency by segment
-                    frequency_by_segment = segment_data.groupby("segment_name")["frequency"].mean().sort_values(ascending=False)
-                    
-                    fig_frequency = create_bar_chart(
-                        x=frequency_by_segment.index,
-                        y=frequency_by_segment.values,
-                        title="세그먼트별 평균 구매빈도(Frequency)",
-                        xlabel="세그먼트",
-                        ylabel="평균 구매빈도",
-                        use_plotly=True
-                    )
-                    
-                    frequency_path = save_plotly_fig(fig_frequency, "rfm_frequency_by_segment.png")
-                    
-                    self.visualizations.append({
-                        "path": frequency_path,
-                        "title": "세그먼트별 평균 구매빈도(Frequency)",
-                        "description": "각 RFM 세그먼트의 평균 구매빈도를 보여줍니다.",
-                        "segment_type": segment_type
-                    })
-                    
-                    # Monetary by segment
-                    monetary_by_segment = segment_data.groupby("segment_name")["monetary"].mean().sort_values(ascending=False)
-                    
-                    fig_monetary = create_bar_chart(
-                        x=monetary_by_segment.index,
-                        y=monetary_by_segment.values,
-                        title="세그먼트별 평균 구매금액(Monetary)",
-                        xlabel="세그먼트",
-                        ylabel="평균 구매금액(원)",
-                        use_plotly=True
-                    )
-                    
-                    monetary_path = save_plotly_fig(fig_monetary, "rfm_monetary_by_segment.png")
-                    
-                    self.visualizations.append({
-                        "path": monetary_path,
-                        "title": "세그먼트별 평균 구매금액(Monetary)",
-                        "description": "각 RFM 세그먼트의 평균 구매금액을 보여줍니다.",
-                        "segment_type": segment_type
-                    })
-            
-            elif segment_type == "lifecycle":
-                # Create bar chart for online sessions by lifecycle segment
-                if all(col in segment_data.columns for col in ["lifecycle_segment", "online_sessions"]):
-                    online_by_segment = segment_data.groupby("lifecycle_segment")["online_sessions"].mean().sort_values(ascending=False)
-                    
-                    fig_online = create_bar_chart(
-                        x=online_by_segment.index,
-                        y=online_by_segment.values,
-                        title="라이프사이클 세그먼트별 평균 온라인 세션 수",
-                        xlabel="세그먼트",
-                        ylabel="평균 온라인 세션 수",
-                        use_plotly=True
-                    )
-                    
-                    online_path = save_plotly_fig(fig_online, "lifecycle_online_sessions.png")
-                    
-                    self.visualizations.append({
-                        "path": online_path,
-                        "title": "라이프사이클 세그먼트별 평균 온라인 세션 수",
-                        "description": "각 라이프사이클 세그먼트의 평균 온라인 활동 수준을 보여줍니다.",
-                        "segment_type": segment_type
-                    })
-            
-            elif segment_type == "channel":
-                # Create bar chart for online vs offline activity
-                if all(col in segment_data.columns for col in ["channel_segment", "offline_transactions", "online_sessions"]):
-                    # Calculate average metrics by segment
-                    channel_metrics = segment_data.groupby("channel_segment").agg({
-                        "offline_transactions": "mean",
-                        "online_sessions": "mean"
-                    }).reset_index()
-                    
-                    # Create grouped bar chart
-                    import plotly.graph_objects as go
-                    
-                    fig = go.Figure()
-                    
-                    fig.add_trace(go.Bar(
-                        x=channel_metrics["channel_segment"],
-                        y=channel_metrics["offline_transactions"],
-                        name="평균 오프라인 거래 수",
-                        marker_color='indianred'
-                    ))
-                    
-                    fig.add_trace(go.Bar(
-                        x=channel_metrics["channel_segment"],
-                        y=channel_metrics["online_sessions"],
-                        name="평균 온라인 세션 수",
-                        marker_color='lightsalmon'
-                    ))
-                    
-                    fig.update_layout(
-                        title="채널 세그먼트별 온/오프라인 활동",
-                        xaxis_title="채널 세그먼트",
-                        yaxis_title="평균 활동 수",
-                        barmode='group',
-                        bargap=0.15,
-                        bargroupgap=0.1
-                    )
-                    
-                    channel_path = save_plotly_fig(fig, "channel_activity_comparison.png")
-                    
-                    self.visualizations.append({
-                        "path": channel_path,
-                        "title": "채널 세그먼트별 온/오프라인 활동",
-                        "description": "각 채널 세그먼트의 온라인 및 오프라인 활동 수준을 비교합니다.",
-                        "segment_type": segment_type
-                    })
-            
-            elif segment_type == "category":
-                # Create bar chart for category diversity
-                if all(col in segment_data.columns for col in ["category_segment", "category_diversity"]):
-                    diversity_by_segment = segment_data.groupby("category_segment")["category_diversity"].mean().sort_values(ascending=False)
-                    
-                    fig_diversity = create_bar_chart(
-                        x=diversity_by_segment.index,
-                        y=diversity_by_segment.values,
-                        title="세그먼트별 평균 카테고리 다양성",
-                        xlabel="세그먼트",
-                        ylabel="평균 구매 카테고리 수",
-                        use_plotly=True
-                    )
-                    
-                    diversity_path = save_plotly_fig(fig_diversity, "category_diversity.png")
-                    
-                    self.visualizations.append({
-                        "path": diversity_path,
-                        "title": "세그먼트별 평균 카테고리 다양성",
-                        "description": "각 카테고리 세그먼트의 평균 구매 카테고리 다양성을 보여줍니다.",
-                        "segment_type": segment_type
-                    })
-        
-        logger.info(f"Created {len(self.visualizations)} visualizations")
-    
-    def _generate_report(self) -> None:
-        """Generate a PDF report with segmentation results."""
-        logger.info("Generating segmentation report")
-        
-        from utils.pdf_generator import ReportPDF
-        
-        # Create PDF report
-        report = ReportPDF()
-        report.set_title("가전 리테일 CDP 고객 세그먼테이션 리포트")
-        report.add_date()
-        
-        # Add executive summary
-        summary = f"본 리포트는 가전 리테일 CDP 데이터를 활용한 {len(self.segments)}가지 세그먼테이션 분석 결과를 제시합니다. "
-        summary += "RFM, 라이프사이클, 채널 선호도, 카테고리 선호도 등 다양한 관점에서 고객을 세분화하여 "
-        summary += "타겟 마케팅과 개인화 전략 수립을 위한 인사이트를 제공합니다."
-        
-        report.add_executive_summary(summary)
-        
-        # Add sections for each segment type
-        for segment_type in self.segments.keys():
-            segment_name_map = {
-                "rfm": "RFM 세그먼테이션",
-                "lifecycle": "라이프사이클 세그먼테이션",
-                "channel": "채널 선호도 세그먼테이션",
-                "category": "카테고리 선호도 세그먼테이션",
-                "custom": "커스텀 세그먼테이션"
-            }
-            
-            section_title = segment_name_map.get(segment_type, f"{segment_type} 세그먼테이션")
-            report.add_section(section_title)
-            
-            # Add segment distribution visualization
-            segment_viz = next((v for v in self.visualizations if v["segment_type"] == segment_type and "분포" in v["title"]), None)
-            if segment_viz:
-                report.add_image(segment_viz["path"], width=160, caption=segment_viz["title"])
-                report.add_text(segment_viz["description"])
-            
-            # Add segment counts
-            if segment_type in self.segment_analysis and "segment_counts" in self.segment_analysis[segment_type]:
-                counts = self.segment_analysis[segment_type]["segment_counts"]
-                report.add_subsection("세그먼트 분포")
-                
-                count_text = ""
-                for segment_name, count in counts.items():
-                    percentage = (count / sum(counts.values())) * 100
-                    count_text += f"• {segment_name}: {count}명 ({percentage:.1f}%)\n"
-                
-                report.add_text(count_text)
-            
-            # Add segment insights
-            if segment_type in self.segment_analysis and "insights" in self.segment_analysis[segment_type]:
-                insights = self.segment_analysis[segment_type]["insights"]
-                report.add_subsection("세그먼트 인사이트")
-                report.add_text(insights)
-            
-            # Add additional visualizations
-            segment_vizs = [v for v in self.visualizations if v["segment_type"] == segment_type and "분포" not in v["title"]]
-            for viz in segment_vizs:
-                report.add_image(viz["path"], width=160, caption=viz["title"])
-                report.add_text(viz["description"])
-            
-            # Add validation warnings and recommendations
-            if segment_type in self.segment_validation:
-                warnings = self.segment_validation[segment_type].get("warnings", [])
-                recommendations = self.segment_validation[segment_type].get("recommendations", [])
-                
-                if warnings or recommendations:
-                    report.add_subsection("세그먼트 품질 및 제안")
-                    
-                    if warnings:
-                        report.add_text("주의사항:")
-                        for warning in warnings:
-                            report.add_text(f"• {warning}")
-                    
-                    if recommendations:
-                        report.add_text("개선 제안:")
-                        for recommendation in recommendations:
-                            report.add_text(f"• {recommendation}")
-        
-        # Add overall recommendations section
-        report.add_section("종합 제안 및 활용 방안")
-        
-        # Use LLM to generate overall recommendations
-        all_insights = []
-        for segment_type in self.segments.keys():
-            if segment_type in self.segment_analysis and "insights" in self.segment_analysis[segment_type]:
-                all_insights.append(f"## {segment_type} 세그먼트 인사이트\n{self.segment_analysis[segment_type]['insights']}")
-        
-        all_insights_text = "\n\n".join(all_insights)
-        
-        prompt = f"""
-        당신은 가전 리테일 업체의 고객 세그먼테이션 전문가입니다. 다음 세그먼트 분석 인사이트를 종합하여
-        전체적인 활용 방안과 마케팅 전략 제안을 작성해주세요.
-        
-        {all_insights_text}
-        
-        다음 항목에 대한 종합적인 제안을 작성해주세요:
-        1. 세그먼트 간 연계 활용 방안
-        2. 우선 타겟팅이 필요한 세그먼트
-        3. 세그먼트별 차별화된 마케팅 접근법
-        4. 세그먼테이션 결과의 비즈니스 활용 방안
-        5. 향후 세그먼테이션 개선 방향
-        
-        각 제안은 구체적이고 실행 가능해야 합니다.
-        """
-        
-        response = self.llm.invoke([HumanMessage(content=prompt)])
-        overall_recommendations = response.content
-        
-        report.add_text(overall_recommendations)
-        
-        # Generate and save the report
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        report_path = os.path.join(config.REPORTS_DIR, f"segmentation_report_{timestamp}.pdf")
-        report.output(report_path)
-        
-        # Update state with report path
-        self.report_path = report_path
-        
-        logger.info(f"Segmentation report generated successfully at {report_path}")
-    
-    def get_segments(self, segment_type: str = None) -> Union[Dict[str, pd.DataFrame], pd.DataFrame]:
-        """
-        Get the generated segments.
-        
-        Args:
-            segment_type: Optional segment type to retrieve specific segments
-            
-        Returns:
-            Dictionary with all segments or specific segment DataFrame
-        """
-        if segment_type:
-            if segment_type in self.segments:
-                return self.segments[segment_type]
+                # 커스텀 세그먼트의 경우, 흔히 쓰는 컬럼명을 우선 사용하고
+                # 없으면 'segment' 라는 이름의 컬럼을 시도
+                if "custom_segment" in segment_data.columns:
+                    segment_col = "custom_segment"
+                else:
+                    potential_cols = [col for col in segment_data.columns if "segment" in col.lower()]
+                    segment_col = potential_cols[0] if potential_cols else None
             else:
-                raise ValueError(f"Segment type '{segment_type}' not found")
-        return self.segments
-    
-    def get_segment_analysis(self, segment_type: str = None) -> Union[Dict[str, Any], Any]:
-        """
-        Get the segment analysis results.
-        
-        Args:
-            segment_type: Optional segment type to retrieve specific analysis
+                # 최후의 보루 – 일반적인 이름
+                segment_col = "segment"
             
-        Returns:
-            Dictionary with all analyses or specific analysis
-        """
-        if segment_type:
-            if segment_type in self.segment_analysis:
-                return self.segment_analysis[segment_type]
+            # 실제 컬럼 존재 여부 확인
+            if segment_col and segment_col in segment_data.columns:
+                # -------------------
+                # Pie chart (분포)
+                # -------------------
+                try:
+                    fig = create_pie_chart(
+                        segment_data,
+                        segment_col,
+                        title=f"{segment_type.capitalize()} 세그먼트 분포"
+                    )
+                    chart_path = save_plotly_fig(fig, f"{segment_type}_pie_chart")
+                    self.visualizations.append(
+                        {
+                            "segment_type": segment_type,
+                            "chart_type": "pie",
+                            "path": chart_path,
+                            "title": f"{segment_type.capitalize()} 세그먼트 분포"
+                        }
+                    )
+                except Exception as e:
+                    logger.warning(f"Pie chart 생성 실패 ({segment_type}): {e}")
+                
+                # -------------------
+                # Bar chart (금액/값)
+                # -------------------
+                value_col = None
+                if "monetary" in segment_data.columns:
+                    value_col = "monetary"
+                elif "total_amount" in segment_data.columns:
+                    value_col = "total_amount"
+                
+                if value_col:
+                    try:
+                        fig = create_bar_chart(
+                            segment_data,
+                            x_col=segment_col,
+                            y_col=value_col,
+                            title=f"{segment_type.capitalize()} 세그먼트별 {value_col}"
+                        )
+                        chart_path = save_plotly_fig(fig, f"{segment_type}_bar_chart")
+                        self.visualizations.append(
+                            {
+                                "segment_type": segment_type,
+                                "chart_type": "bar",
+                                "path": chart_path,
+                                "title": f"{segment_type.capitalize()} 세그먼트별 {value_col}"
+                            }
+                        )
+                    except Exception as e:
+                        logger.warning(f"Bar chart 생성 실패 ({segment_type}): {e}")
+                
+                logger.info(f"Created visualizations for {segment_type} segments")
             else:
-                raise ValueError(f"Segment analysis for '{segment_type}' not found")
-        return self.segment_analysis
-    
-    def get_visualizations(self) -> List[Dict[str, Any]]:
-        """
-        Get the visualizations generated from the segmentation.
-        
-        Returns:
-            List of visualization dictionaries with paths and metadata
-        """
-        return self.visualizations
-    
-    def get_report_path(self) -> str:
-        """
-        Get the path to the generated report.
-        
-        Returns:
-            Path to the PDF report
-        """
-        return self.report_path
-    
-    def create_custom_segment(self, segment_name: str, query: str) -> pd.DataFrame:
-        """
-        Create a custom segment using SQL query.
-        
-        Args:
-            segment_name: Name for the custom segment
-            query: SQL query to define the segment
-            
-        Returns:
-            DataFrame with the custom segment
-        """
-        logger.info(f"Creating custom segment: {segment_name}")
-        
-        # Validate query
-        self._validate_query(query)
-        
-        # Execute query
-        segment_data = self.execute_query(query)
-        
-        # Store segment
-        self.segments[segment_name] = segment_data
-        
-        # Analyze the new segment
-        segment_col = None
-        potential_cols = [col for col in segment_data.columns if "segment" in col.lower()]
-        if potential_cols:
-            segment_col = potential_cols[0]
-            self._analyze_segments()
-            self._validate_segments()
-            self._create_visualizations()
-        
-        logger.info(f"Created custom segment with {len(segment_data)} customers")
-        return segment_data
-    
-    def compare_segments(self, segment_type1: str, segment_type2: str) -> Dict[str, Any]:
-        """
-        Compare two different segment types.
-        
-        Args:
-            segment_type1: First segment type
-            segment_type2: Second segment type
-            
-        Returns:
-            Dictionary with comparison results
-        """
-        logger.info(f"Comparing segments: {segment_type1} vs {segment_type2}")
-        
-        if segment_type1 not in self.segments:
-            raise ValueError(f"Segment type '{segment_type1}' not found")
-        
-        if segment_type2 not in self.segments:
-            raise ValueError(f"Segment type '{segment_type2}' not found")
-        
-        # Get segment data
-        segment_data1 = self.segments[segment_type1]
-        segment_data2 = self.segments[segment_type2]
-        
-        # Get segment column names
-        segment_col1 = None
-        segment_col2 = None
-        
-        for segment_type, col_name in [
-            (segment_type1, "segment_name"),
-            (segment_type1, "lifecycle_segment"),
-            (segment_type1, "channel_segment"),
-            (segment_type1, "category_segment")
-        ]:
-            if col_name in self.segments[segment_type].columns:
-                segment_col1 = col_name
-                break
-        
-        for segment_type, col_name in [
-            (segment_type2, "segment_name"),
-            (segment_type2, "lifecycle_segment"),
-            (segment_type2, "channel_segment"),
-            (segment_type2, "category_segment")
-        ]:
-            if col_name in self.segments[segment_type].columns:
-                segment_col2 = col_name
-                break
-        
-        # If segment columns not found, try to find them
-        if not segment_col1:
-            potential_cols = [col for col in segment_data1.columns if "segment" in col.lower()]
-            if potential_cols:
-                segment_col1 = potential_cols[0]
-        
-        if not segment_col2:
-            potential_cols = [col for col in segment_data2.columns if "segment" in col.lower()]
-            if potential_cols:
-                segment_col2 = potential_cols[0]
-        
-        # If still not found, return error
-        if not segment_col1 or not segment_col2:
-            raise ValueError("Could not identify segment columns for comparison")
-        
-        # Merge segments on customer_id
-        if "customer_id" in segment_data1.columns and "customer_id" in segment_data2.columns:
-            merged_data = pd.merge(
-                segment_data1[["customer_id", segment_col1]],
-                segment_data2[["customer_id", segment_col2]],
-                on="customer_id",
-                how="inner"
-            )
-            
-            # Create cross-tabulation
-            crosstab = pd.crosstab(
-                merged_data[segment_col1],
-                merged_data[segment_col2],
-                normalize="index"
-            ) * 100
-            
-            # Create heatmap visualization
-            from utils.visualization import create_heatmap, save_plotly_fig
-            
-            fig = create_heatmap(
-                data_matrix=crosstab.values,
-                x_labels=crosstab.columns,
-                y_labels=crosstab.index,
-                title=f"{segment_type1} vs {segment_type2} 세그먼트 비교",
-                xlabel=f"{segment_type2} 세그먼트",
-                ylabel=f"{segment_type1} 세그먼트",
-                use_plotly=True
-            )
-            
-            heatmap_path = save_plotly_fig(fig, f"{segment_type1}_vs_{segment_type2}_heatmap.png")
-            
-            self.visualizations.append({
-                "path": heatmap_path,
-                "title": f"{segment_type1} vs {segment_type2} 세그먼트 비교",
-                "description": f"{segment_type1}과 {segment_type2} 세그먼트 간의 관계를 보여줍니다. 값은 행 기준 백분율입니다.",
-                "segment_type": "comparison"
-            })
-            
-            # Generate insights using LLM
-            prompt = f"""
-            당신은 가전 리테일 업체의 고객 세그먼테이션 전문가입니다. 다음 두 세그먼테이션 간의 
-            교차 분석 결과를 검토하고 주요 인사이트를 작성해주세요.
-            
-            ## 교차 분석 결과
-            {crosstab.to_string()}
-            
-            위 데이터는 {segment_type1} 세그먼트(행)와 {segment_type2} 세그먼트(열) 간의 관계를 보여줍니다.
-            값은 행 기준 백분율입니다.
-            
-            두 세그먼테이션 간의 관계, 주요 패턴, 마케팅 활용 방안에 대한 인사이트를 작성해주세요.
-            """
-            
-            response = self.llm.invoke([HumanMessage(content=prompt)])
-            comparison_insights = response.content
-            
-            return {
-                "crosstab": crosstab,
-                "visualization_path": heatmap_path,
-                "insights": comparison_insights,
-                "segment_types": (segment_type1, segment_type2),
-                "segment_columns": (segment_col1, segment_col2)
-            }
-        else:
-            raise ValueError("Both segment types must contain customer_id column for comparison")
+                logger.warning(
+                    f"Could not create visualization for {segment_type}: "
+                    f"segment column '{segment_col}' not found in data"
+                )
 
-# For direct execution
-if __name__ == "__main__":
-    # Set up logging
-    logging.basicConfig(level=logging.INFO)
-    
-    # Create and run the agent
-    agent = SegmentationAgent()
-    report_path = agent.run()
-    
-    print(f"Report generated at: {report_path}")
-    print(f"Generated {len(agent.get_segments())} segment types")
-    print(f"Created {len(agent.get_visualizations())} visualizations")
+    def _generate_report(self) -> None:
+        """Generate a simple HTML report that summarizes all segmentation outputs."""
+        logger.info("Generating segmentation report")
+
+        # Lazy imports (report 생성 시에만 필요)
+        from datetime import datetime
+
+        # 1) 리포트 저장 경로 준비
+        report_dir = os.path.join(os.getcwd(), "reports")
+        os.makedirs(report_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.report_path = os.path.join(report_dir, f"segmentation_report_{timestamp}.html")
+
+        def _escape_html(txt: str) -> str:
+            """간단한 HTML escape."""
+            return (
+                txt.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;")
+            )
+
+        # 2) HTML 시작
+        html_parts: List[str] = [
+            "<!DOCTYPE html>",
+            "<html><head><meta charset='utf-8'>",
+            "<title>Segmentation Report</title>",
+            "<style>",
+            "body{font-family:Arial,Helvetica,sans-serif;margin:20px;}",
+            "h1,h2,h3{color:#2c3e50;}",
+            "table{border-collapse:collapse;width:100%;margin:10px 0;}",
+            "th,td{border:1px solid #ddd;padding:6px;text-align:left;}",
+            "th{background:#f4f4f4;}",
+            ".warning{color:#e74c3c;}",
+            ".recommendation{color:#27ae60;}",
+            ".viz img{max-width:100%;height:auto;}",
+            "</style></head><body>",
+            f"<h1>고객 세그먼테이션 리포트</h1>",
+            f"<p>생성일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>",
+        ]
+
+        # 3) 세그먼트별 정보 정리
+        for segment_type, segment_data in self.segments.items():
+            html_parts.append(f"<h2>{segment_type.upper()} 세그먼테이션</h2>")
+
+            # (a) 사용된 쿼리
+            query_txt = self.queries.get(segment_type)
+            if query_txt:
+                html_parts.append("<details><summary>사용된 쿼리 보기</summary><pre>")
+                html_parts.append(_escape_html(query_txt))
+                html_parts.append("</pre></details>")
+
+            # (b) 분포 테이블
+            counts = self.segment_analysis.get(segment_type, {}).get("segment_counts", {})
+            if counts:
+                html_parts.append("<h3>세그먼트 분포</h3>")
+                html_parts.append("<table><tr><th>세그먼트</th><th>고객 수</th><th>비율</th></tr>")
+                total_cnt = sum(counts.values()) or 1
+                for name, cnt in counts.items():
+                    pct = cnt / total_cnt * 100
+                    html_parts.append(
+                        f"<tr><td>{_escape_html(str(name))}</td><td>{cnt}</td><td>{pct:.1f}%</td></tr>"
+                    )
+                html_parts.append("</table>")
+
+            # (c) 인사이트
+            insights = self.segment_analysis.get(segment_type, {}).get("insights")
+            if insights:
+                html_parts.append("<h3>세그먼트 인사이트</h3>")
+                html_parts.append(
+                    "<p>" + _escape_html(insights).replace("\n", "<br>") + "</p>"
+                )
+
+            # (d) 검증 결과
+            validation = self.segment_validation.get(segment_type, {})
+            warns = validation.get("warnings", [])
+            recs = validation.get("recommendations", [])
+            if warns:
+                html_parts.append("<h3>주의사항</h3><ul class='warning'>")
+                html_parts.extend([f"<li>{_escape_html(w)}</li>" for w in warns])
+                html_parts.append("</ul>")
+            if recs:
+                html_parts.append("<h3>개선 제안</h3><ul class='recommendation'>")
+                html_parts.extend([f"<li>{_escape_html(r)}</li>" for r in recs])
+                html_parts.append("</ul>")
+
+            # (e) 시각화
+            viz_list = [v for v in self.visualizations if v["segment_type"] == segment_type]
+            if viz_list:
+                html_parts.append("<div class='viz'>")
+                for v in viz_list:
+                    rel_path = os.path.relpath(v["path"], report_dir)
+                    html_parts.append(
+                        f"<figure><img src='{_escape_html(rel_path)}' "
+                        f"alt='{_escape_html(v['title'])}'><figcaption>{_escape_html(v['title'])}</figcaption></figure>"
+                    )
+                html_parts.append("</div>")
+
+        # 4) HTML 종료
+        html_parts.append("</body></html>")
+
+        # 5) 파일 저장
+        with open(self.report_path, "w", encoding="utf-8") as fp:
+            fp.write("\n".join(html_parts))
+
+        logger.info(f"Segmentation report generated: {self.report_path}")
