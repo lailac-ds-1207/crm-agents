@@ -29,6 +29,16 @@ class Text2SQLConverter:
     that can be executed against the CDP database.
     """
     
+
+    ...
+
+    def convert(self, text_request: str) -> str:
+        ...
+        # 기존 흐름 유지 후, 마지막에 날짜 문자열 처리 추가
+
+
+
+    
     def __init__(
         self,
         project_id: str = None,
@@ -93,8 +103,15 @@ class Text2SQLConverter:
         sql_query = self._validate_and_refine_query(sql_query, text_request)
         
         logger.info(f"Generated SQL query: {sql_query[:100]}...")
+        
+        # self.fix_parse_datetime_for_short_dates(sql_query)
+        print('########################')
+        # if 'PARSE_DATETIME' in sql_query:
+        # sql_query = self._wrap_date_literals(sql_query)
+        sql_query= sql_query.replace("PARSE_DATETIME('%Y-%m-%d %H:%M:%S', t.transaction_date)",
+                          "PARSE_DATE('%Y-%m-%d', t.transaction_date)")
+        
         return sql_query
-    
     def _get_schema_info(self) -> str:
         """
         Get database schema information for the prompt.

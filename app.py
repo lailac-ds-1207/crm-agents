@@ -23,7 +23,7 @@ from agents.reporting_agent.agent import ReportingAgent
 
 # Import utility modules
 from utils.bigquery import BigQueryConnector
-from utils.visualization import create_bar_chart, create_pie_chart, save_plotly_fig
+# from utils.visualization import create_bar_chart, create_pie_chart, save_plotly_fig
 import config
 
 # Configure page

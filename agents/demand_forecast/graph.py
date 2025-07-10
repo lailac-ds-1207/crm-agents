@@ -1,28 +1,27 @@
 """
 LangGraph-based workflow definition for the Demand Forecast Agent.
+
 This module defines the graph structure and flow for demand forecasting.
 """
+
 from typing import Dict, List, Any, TypedDict, Optional, Annotated, Literal
 import os
 from pathlib import Path
 import logging
 from datetime import datetime, timedelta
-
 import pandas as pd
 import numpy as np
 from prophet import Prophet
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
-
 import config
 from utils.bigquery import BigQueryConnector
-from utils.visualization import create_time_series_plot, save_plotly_fig
+from utils.visualization import create_time_series_plot, save_matplotlib_fig
 
 # Configure logging
 logging.basicConfig(
@@ -81,7 +80,6 @@ def get_llm():
     )
 
 # Define the sub-agent functions
-
 def data_preparer(state: ForecastState) -> ForecastState:
     """
     Prepare time series data for forecasting.
@@ -100,21 +98,21 @@ def data_preparer(state: ForecastState) -> ForecastState:
         
         # Get transaction data for time series preparation
         query = f"""
-        SELECT 
+        SELECT
             PARSE_DATE('%Y-%m-%d', transaction_date) AS date,
             p.category_level_1,
             COUNT(t.transaction_id) as sales_count,
             SUM(t.total_amount) as sales_amount,
             SUM(t.quantity) as quantity_sold
-        FROM 
+        FROM
             `{state["dataset_id"]}.offline_transactions` t
-        JOIN 
+        JOIN
             `{state["dataset_id"]}.product_master` p
-        ON 
+        ON
             t.product_id = p.product_id
-        GROUP BY 
+        GROUP BY
             date, p.category_level_1
-        ORDER BY 
+        ORDER BY
             date ASC
         """
         
@@ -143,7 +141,7 @@ def data_preparer(state: ForecastState) -> ForecastState:
                     'quantity_sold': 'sum',
                     'category_level_1': 'first'  # Keep category information
                 }).reset_index()
-            
+                
             category_data[category] = category_sales
         
         # Check for data quality issues
@@ -177,7 +175,7 @@ def data_preparer(state: ForecastState) -> ForecastState:
                 for col in numeric_cols:
                     if col in cat_df.columns:
                         cat_df[col] = cat_df[col].interpolate(method='linear').fillna(0)
-                
+                        
                 category_data[category] = cat_df
         
         # Check for outliers and handle them
@@ -189,13 +187,13 @@ def data_preparer(state: ForecastState) -> ForecastState:
             if outliers.sum() > 0:
                 logger.info(f"Found {outliers.sum()} outliers in {column}. Replacing with median.")
                 df.loc[outliers, column] = df[column].median()
-            
+                
             return df
         
         # Handle outliers in total sales
         for col in ['sales_amount', 'sales_count', 'quantity_sold']:
             total_sales = handle_outliers(total_sales, col)
-        
+            
         # Handle outliers in category data
         for category in category_data:
             for col in ['sales_amount', 'sales_count', 'quantity_sold']:
@@ -222,9 +220,9 @@ def data_preparer(state: ForecastState) -> ForecastState:
         
     except Exception as e:
         logger.error(f"Data Preparer: Error preparing time series data - {str(e)}")
-        state["error"] = f"시계열 데이터 준비 중 오류 발생: {str(e)}"
+        state["error"] = f"Error preparing time series data: {str(e)}"
         state["next_agent"] = END
-    
+        
     return state
 
 def model_selector(state: ForecastState) -> ForecastState:
@@ -364,6 +362,7 @@ def model_selector(state: ForecastState) -> ForecastState:
         for category in categories:
             cat_df = category_data[category]
             best_model_cat, metrics_cat = select_best_model(cat_df)
+            
             selected_models[category] = {
                 'model_type': best_model_cat,
                 'target_column': 'sales_amount',
@@ -382,9 +381,9 @@ def model_selector(state: ForecastState) -> ForecastState:
         
     except Exception as e:
         logger.error(f"Model Selector: Error selecting models - {str(e)}")
-        state["error"] = f"모델 선택 중 오류 발생: {str(e)}"
+        state["error"] = f"Error selecting models: {str(e)}"
         state["next_agent"] = END
-    
+        
     return state
 
 def model_trainer(state: ForecastState) -> ForecastState:
@@ -440,7 +439,6 @@ def model_trainer(state: ForecastState) -> ForecastState:
             # Calculate metrics
             y_true = prophet_data['y'].values
             y_pred = forecast['yhat'].values
-            
             rmse = np.sqrt(mean_squared_error(y_true, y_pred))
             mae = mean_absolute_error(y_true, y_pred)
             r2 = r2_score(y_true, y_pred)
@@ -460,7 +458,7 @@ def model_trainer(state: ForecastState) -> ForecastState:
                 order = total_model_info['metrics']['arima']['order']
             else:
                 order = (1, 1, 1)  # Default order
-            
+                
             # Train ARIMA model
             model = ARIMA(arima_data, order=order)
             model_fit = model.fit()
@@ -476,7 +474,6 @@ def model_trainer(state: ForecastState) -> ForecastState:
             # Calculate in-sample metrics
             y_true = arima_data
             y_pred = model_fit.fittedvalues
-            
             rmse = np.sqrt(mean_squared_error(y_true[len(y_true)-len(y_pred):], y_pred))
             mae = mean_absolute_error(y_true[len(y_true)-len(y_pred):], y_pred)
             r2 = r2_score(y_true[len(y_true)-len(y_pred):], y_pred)
@@ -522,7 +519,6 @@ def model_trainer(state: ForecastState) -> ForecastState:
                 # Calculate metrics
                 y_true = prophet_data['y'].values
                 y_pred = forecast['yhat'].values
-                
                 rmse = np.sqrt(mean_squared_error(y_true, y_pred))
                 mae = mean_absolute_error(y_true, y_pred)
                 r2 = r2_score(y_true, y_pred)
@@ -542,7 +538,7 @@ def model_trainer(state: ForecastState) -> ForecastState:
                     order = cat_model_info['metrics']['arima']['order']
                 else:
                     order = (1, 1, 1)  # Default order
-                
+                    
                 # Train ARIMA model
                 model = ARIMA(arima_data, order=order)
                 model_fit = model.fit()
@@ -558,7 +554,6 @@ def model_trainer(state: ForecastState) -> ForecastState:
                 # Calculate in-sample metrics
                 y_true = arima_data
                 y_pred = model_fit.fittedvalues
-                
                 rmse = np.sqrt(mean_squared_error(y_true[len(y_true)-len(y_pred):], y_pred))
                 mae = mean_absolute_error(y_true[len(y_true)-len(y_pred):], y_pred)
                 r2 = r2_score(y_true[len(y_true)-len(y_pred):], y_pred)
@@ -582,9 +577,9 @@ def model_trainer(state: ForecastState) -> ForecastState:
         
     except Exception as e:
         logger.error(f"Model Trainer: Error training models - {str(e)}")
-        state["error"] = f"모델 학습 중 오류 발생: {str(e)}"
+        state["error"] = f"Error training models: {str(e)}"
         state["next_agent"] = END
-    
+        
     return state
 
 def forecaster(state: ForecastState) -> ForecastState:
@@ -636,13 +631,13 @@ def forecaster(state: ForecastState) -> ForecastState:
             
             # Create a DataFrame similar to Prophet's output for consistency
             last_date = pd.to_datetime(state["time_series_data"]["end_date"])
-            future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=forecast_horizon_days)
+            future_dates = pd.date_range(start=last_date+timedelta(days=1), periods=forecast_horizon_days)
             
             forecast_df = pd.DataFrame({
                 'ds': pd.concat([pd.Series(model_fit.model.data.dates), pd.Series(future_dates)]),
                 'yhat': pd.concat([pd.Series(model_fit.fittedvalues), pd.Series(forecast)]),
-                'yhat_lower': pd.concat([pd.Series(model_fit.fittedvalues * 0.9), pd.Series(forecast * 0.9)]),
-                'yhat_upper': pd.concat([pd.Series(model_fit.fittedvalues * 1.1), pd.Series(forecast * 1.1)])
+                'yhat_lower': pd.concat([pd.Series(model_fit.fittedvalues*0.9), pd.Series(forecast*0.9)]),
+                'yhat_upper': pd.concat([pd.Series(model_fit.fittedvalues*1.1), pd.Series(forecast*1.1)])
             })
             
             # Store forecast results
@@ -681,13 +676,13 @@ def forecaster(state: ForecastState) -> ForecastState:
                 
                 # Create a DataFrame similar to Prophet's output for consistency
                 last_date = pd.to_datetime(state["time_series_data"]["end_date"])
-                future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=forecast_horizon_days)
+                future_dates = pd.date_range(start=last_date+timedelta(days=1), periods=forecast_horizon_days)
                 
                 forecast_df = pd.DataFrame({
                     'ds': pd.concat([pd.Series(model_fit.model.data.dates), pd.Series(future_dates)]),
                     'yhat': pd.concat([pd.Series(model_fit.fittedvalues), pd.Series(forecast)]),
-                    'yhat_lower': pd.concat([pd.Series(model_fit.fittedvalues * 0.9), pd.Series(forecast * 0.9)]),
-                    'yhat_upper': pd.concat([pd.Series(model_fit.fittedvalues * 1.1), pd.Series(forecast * 1.1)])
+                    'yhat_lower': pd.concat([pd.Series(model_fit.fittedvalues*0.9), pd.Series(forecast*0.9)]),
+                    'yhat_upper': pd.concat([pd.Series(model_fit.fittedvalues*1.1), pd.Series(forecast*1.1)])
                 })
                 
                 # Store forecast results
@@ -710,9 +705,9 @@ def forecaster(state: ForecastState) -> ForecastState:
         
     except Exception as e:
         logger.error(f"Forecaster: Error generating forecasts - {str(e)}")
-        state["error"] = f"예측 생성 중 오류 발생: {str(e)}"
+        state["error"] = f"Error generating forecasts: {str(e)}"
         state["next_agent"] = END
-    
+        
     return state
 
 def result_analyzer(state: ForecastState) -> ForecastState:
@@ -745,65 +740,47 @@ def result_analyzer(state: ForecastState) -> ForecastState:
             fig = create_time_series_plot(
                 forecast_df,
                 x_column='ds',
-                y_column='yhat',
-                title='총 매출액 예측',
-                xlabel='날짜',
-                ylabel='매출액',
-                use_plotly=True
+                y_columns='yhat',
+                title='Total Sales Forecast',
+                xlabel='Date',
+                ylabel='Sales Amount'
             )
             
-            # Add confidence intervals
-            fig.add_trace({
-                'x': forecast_df['ds'],
-                'y': forecast_df['yhat_upper'],
-                'mode': 'lines',
-                'line': {'width': 0},
-                'showlegend': False
-            })
-            
-            fig.add_trace({
-                'x': forecast_df['ds'],
-                'y': forecast_df['yhat_lower'],
-                'mode': 'lines',
-                'line': {'width': 0},
-                'fill': 'tonexty',
-                'fillcolor': 'rgba(0, 100, 80, 0.2)',
-                'name': '95% 신뢰 구간'
-            })
+            # Add confidence intervals using matplotlib
+            import matplotlib.pyplot as plt
+            plt.fill_between(forecast_df['ds'], forecast_df['yhat_lower'], forecast_df['yhat_upper'], 
+                             alpha=0.2, color='green', label='95% Confidence Interval')
+            plt.legend()
             
             # Save visualization
-            viz_path = save_plotly_fig(fig, "total_sales_forecast.png")
+            viz_path = save_matplotlib_fig(fig, "total_sales_forecast.png")
             visualizations.append({
                 'path': viz_path,
-                'title': '총 매출액 예측',
-                'description': '향후 기간 동안의 총 매출액 예측 결과입니다.'
+                'title': 'Total Sales Forecast',
+                'description': 'Forecast of total sales for the future period.'
             })
             
             # 2. Analyze seasonality
+            # Define month names
+            month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                           'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+            
+            # Extract seasonality components from forecast DataFrame
+            df = forecast_df.copy()
+            df['day'] = pd.to_datetime(df['ds']).dt.day_name()
+            weekly_effect_df = df.groupby('day')['weekly'].mean().reset_index().rename(columns={'weekly':'effect'})
+            
+            # Yearly component
+            yearly_effect_df = df.copy()
+            yearly_effect_df['month'] = yearly_effect_df['ds'].dt.month
+            yearly_effect_df = yearly_effect_df.groupby('month')['yearly'].mean().reset_index().rename(columns={'yearly':'effect'})
+            yearly_effect_df['month_name'] = yearly_effect_df['month'].apply(lambda x: month_names[x-1])
+            
             seasonality_components = {
-                'weekly': pd.DataFrame({
-                    'day': ['월', '화', '수', '목', '금', '토', '일'],
-                    'effect': model.seasonalities['weekly'].effect
-                }),
-                'yearly': pd.DataFrame({
-                    'day_of_year': range(1, 366),
-                    'effect': model.seasonalities['yearly'].effect
-                })
+                'weekly': weekly_effect_df,
+                'yearly': yearly_effect_df,
+                'monthly': yearly_effect_df.copy()
             }
-            
-            # Add month information to yearly seasonality
-            seasonality_components['yearly']['month'] = pd.to_datetime(
-                seasonality_components['yearly']['day_of_year'].apply(lambda x: f"2022-{x}"), 
-                format="%Y-%j"
-            ).dt.month
-            
-            # Calculate monthly effect
-            monthly_effect = seasonality_components['yearly'].groupby('month')['effect'].mean().reset_index()
-            month_names = ['1월', '2월', '3월', '4월', '5월', '6월', 
-                         '7월', '8월', '9월', '10월', '11월', '12월']
-            monthly_effect['month_name'] = monthly_effect['month'].apply(lambda x: month_names[x-1])
-            
-            seasonality_components['monthly'] = monthly_effect
             
         else:  # ARIMA model
             forecast_df = total_forecast['forecast']
@@ -812,68 +789,50 @@ def result_analyzer(state: ForecastState) -> ForecastState:
             fig = create_time_series_plot(
                 forecast_df,
                 x_column='ds',
-                y_column='yhat',
-                title='총 매출액 예측',
-                xlabel='날짜',
-                ylabel='매출액',
-                use_plotly=True
+                y_columns='yhat',
+                title='Total Sales Forecast',
+                xlabel='Date',
+                ylabel='Sales Amount'
             )
             
-            # Add confidence intervals
-            fig.add_trace({
-                'x': forecast_df['ds'],
-                'y': forecast_df['yhat_upper'],
-                'mode': 'lines',
-                'line': {'width': 0},
-                'showlegend': False
-            })
-            
-            fig.add_trace({
-                'x': forecast_df['ds'],
-                'y': forecast_df['yhat_lower'],
-                'mode': 'lines',
-                'line': {'width': 0},
-                'fill': 'tonexty',
-                'fillcolor': 'rgba(0, 100, 80, 0.2)',
-                'name': '95% 신뢰 구간'
-            })
+            # Add confidence intervals using matplotlib
+            import matplotlib.pyplot as plt
+            plt.fill_between(forecast_df['ds'], forecast_df['yhat_lower'], forecast_df['yhat_upper'], 
+                             alpha=0.2, color='green', label='95% Confidence Interval')
+            plt.legend()
             
             # Save visualization
-            viz_path = save_plotly_fig(fig, "total_sales_forecast.png")
+            viz_path = save_matplotlib_fig(fig, "total_sales_forecast.png")
             visualizations.append({
                 'path': viz_path,
-                'title': '총 매출액 예측',
-                'description': '향후 기간 동안의 총 매출액 예측 결과입니다.'
+                'title': 'Total Sales Forecast',
+                'description': 'Forecast of total sales for the future period.'
             })
             
             # For ARIMA, we don't have built-in seasonality components
             # We'll create a simple approximation
-            
             # Get the time series data
             time_series_data = state["time_series_data"]["total_sales"]
             
             # Calculate weekly seasonality
             time_series_data['day_of_week'] = time_series_data['date'].dt.dayofweek
             weekly_effect = time_series_data.groupby('day_of_week')['sales_amount'].mean()
-            weekly_effect = weekly_effect / weekly_effect.mean()  # Normalize
-            
+            weekly_effect = weekly_effect/weekly_effect.mean()  # Normalize
             weekly_seasonality = pd.DataFrame({
-                'day': ['월', '화', '수', '목', '금', '토', '일'],
+                'day': ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
                 'effect': weekly_effect.values
             })
             
             # Calculate monthly seasonality
             time_series_data['month'] = time_series_data['date'].dt.month
             monthly_effect = time_series_data.groupby('month')['sales_amount'].mean()
-            monthly_effect = monthly_effect / monthly_effect.mean()  # Normalize
-            
+            monthly_effect = monthly_effect/monthly_effect.mean()  # Normalize
             monthly_seasonality = pd.DataFrame({
                 'month': range(1, 13),
                 'effect': [monthly_effect.get(i, 1.0) for i in range(1, 13)]
             })
-            
-            month_names = ['1월', '2월', '3월', '4월', '5월', '6월', 
-                         '7월', '8월', '9월', '10월', '11월', '12월']
+            month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                           'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
             monthly_seasonality['month_name'] = monthly_seasonality['month'].apply(lambda x: month_names[x-1])
             
             seasonality_components = {
@@ -917,17 +876,17 @@ def result_analyzer(state: ForecastState) -> ForecastState:
         fig = create_time_series_plot(
             weekly_df,
             x_column='day',
-            y_column='effect',
-            title='요일별 판매 효과',
-            xlabel='요일',
-            ylabel='효과',
-            use_plotly=True
+            y_columns='effect',
+            title='Daily Sales Effect',
+            xlabel='Day',
+            ylabel='Effect'
         )
-        viz_path = save_plotly_fig(fig, "weekly_seasonality.png")
+        
+        viz_path = save_matplotlib_fig(fig, "weekly_seasonality.png")
         visualizations.append({
             'path': viz_path,
-            'title': '요일별 판매 효과',
-            'description': '요일에 따른 판매 패턴을 보여줍니다.'
+            'title': 'Daily Sales Effect',
+            'description': 'Shows the sales pattern by day of week.'
         })
         state["seasonality"]["visualization_paths"].append(viz_path)
         
@@ -936,17 +895,17 @@ def result_analyzer(state: ForecastState) -> ForecastState:
         fig = create_time_series_plot(
             monthly_df,
             x_column='month_name',
-            y_column='effect',
-            title='월별 판매 효과',
-            xlabel='월',
-            ylabel='효과',
-            use_plotly=True
+            y_columns='effect',
+            title='Monthly Sales Effect',
+            xlabel='Month',
+            ylabel='Effect'
         )
-        viz_path = save_plotly_fig(fig, "monthly_seasonality.png")
+        
+        viz_path = save_matplotlib_fig(fig, "monthly_seasonality.png")
         visualizations.append({
             'path': viz_path,
-            'title': '월별 판매 효과',
-            'description': '월별 판매 패턴을 보여줍니다.'
+            'title': 'Monthly Sales Effect',
+            'description': 'Shows the sales pattern by month.'
         })
         state["seasonality"]["visualization_paths"].append(viz_path)
         
@@ -960,43 +919,28 @@ def result_analyzer(state: ForecastState) -> ForecastState:
             fig = create_time_series_plot(
                 forecast_df,
                 x_column='ds',
-                y_column='yhat',
-                title=f'{category} 카테고리 매출액 예측',
-                xlabel='날짜',
-                ylabel='매출액',
-                use_plotly=True
+                y_columns='yhat',
+                title=f'{category} Category Sales Forecast',
+                xlabel='Date',
+                ylabel='Sales Amount'
             )
             
-            # Add confidence intervals
-            fig.add_trace({
-                'x': forecast_df['ds'],
-                'y': forecast_df['yhat_upper'],
-                'mode': 'lines',
-                'line': {'width': 0},
-                'showlegend': False
-            })
-            
-            fig.add_trace({
-                'x': forecast_df['ds'],
-                'y': forecast_df['yhat_lower'],
-                'mode': 'lines',
-                'line': {'width': 0},
-                'fill': 'tonexty',
-                'fillcolor': 'rgba(0, 100, 80, 0.2)',
-                'name': '95% 신뢰 구간'
-            })
+            # Add confidence intervals using matplotlib
+            import matplotlib.pyplot as plt
+            plt.fill_between(forecast_df['ds'], forecast_df['yhat_lower'], forecast_df['yhat_upper'], 
+                             alpha=0.2, color='green', label='95% Confidence Interval')
+            plt.legend()
             
             # Save visualization
-            viz_path = save_plotly_fig(fig, f"{category}_forecast.png")
+            viz_path = save_matplotlib_fig(fig, f"{category}_forecast.png")
             visualizations.append({
                 'path': viz_path,
-                'title': f'{category} 카테고리 매출액 예측',
-                'description': f'{category} 카테고리의 향후 기간 동안의 매출액 예측 결과입니다.'
+                'title': f'{category} Category Sales Forecast',
+                'description': f'Forecast of sales for the {category} category over the future period.'
             })
             
             # Calculate growth rate
             future_forecast = forecast_df[pd.to_datetime(forecast_df['ds']).dt.date > current_date]
-            
             past_30d_data = forecast_df[
                 (pd.to_datetime(forecast_df['ds']).dt.date <= current_date) &
                 (pd.to_datetime(forecast_df['ds']).dt.date >= current_date - timedelta(days=30))
@@ -1008,7 +952,6 @@ def result_analyzer(state: ForecastState) -> ForecastState:
                 past_30d_avg = forecast_df[pd.to_datetime(forecast_df['ds']).dt.date <= current_date]['yhat'].mean()
                 
             future_avg = future_forecast['yhat'].mean()
-            
             growth_rate = ((future_avg / past_30d_avg) - 1) * 100 if past_30d_avg > 0 else 0
             
             category_growth.append({
@@ -1020,22 +963,21 @@ def result_analyzer(state: ForecastState) -> ForecastState:
         
         # Create category growth rate visualization
         category_growth_df = pd.DataFrame(category_growth)
-        
         if len(category_growth_df) > 0:
             fig = create_time_series_plot(
                 category_growth_df,
                 x_column='category',
-                y_column='growth_rate',
-                title='카테고리별 예상 성장률',
-                xlabel='카테고리',
-                ylabel='성장률 (%)',
-                use_plotly=True
+                y_columns='growth_rate',
+                title='Expected Growth Rate by Category',
+                xlabel='Category',
+                ylabel='Growth Rate (%)'
             )
-            viz_path = save_plotly_fig(fig, "category_growth_rates.png")
+            
+            viz_path = save_matplotlib_fig(fig, "category_growth_rates.png")
             visualizations.append({
                 'path': viz_path,
-                'title': '카테고리별 예상 성장률',
-                'description': '각 카테고리의 향후 예상 성장률을 보여줍니다.'
+                'title': 'Expected Growth Rate by Category',
+                'description': 'Shows the expected growth rate for each product category.'
             })
         
         # Store growth rates in state
@@ -1057,9 +999,9 @@ def result_analyzer(state: ForecastState) -> ForecastState:
         
     except Exception as e:
         logger.error(f"Result Analyzer: Error analyzing forecasts - {str(e)}")
-        state["error"] = f"예측 분석 중 오류 발생: {str(e)}"
+        state["error"] = f"Error analyzing forecasts: {str(e)}"
         state["next_agent"] = END
-    
+        
     return state
 
 def report_generator(state: ForecastState) -> ForecastState:
@@ -1096,29 +1038,30 @@ def report_generator(state: ForecastState) -> ForecastState:
             monthly_seasonality_str = seasonality['monthly'].to_string()
             
             prompt = f"""
-            당신은 가전 리테일 업체의 수요 예측 전문가입니다. 다음 예측 결과를 검토하고 주요 인사이트를 도출해주세요.
-            
-            ## 전체 매출 예측
-            - 향후 {state["forecast_horizon_weeks"]}주 동안의 예상 총 매출 성장률: {total_growth_rate:.2f}%
-            
-            ## 카테고리별 성장률 예측
+            You are a demand forecasting expert for an electronics retail company. Please review the following forecast results and provide key insights.
+
+            ## Total Sales Forecast
+            - Expected total sales growth rate for the next {state["forecast_horizon_weeks"]} weeks: {total_growth_rate:.2f}%
+
+            ## Category Growth Rate Forecast
             {category_growth_str}
-            
-            ## 계절성 분석
-            - 요일별 판매 효과:
+
+            ## Seasonality Analysis
+            - Daily sales effect:
             {weekly_seasonality_str}
-            
-            - 월별 판매 효과:
+
+            - Monthly sales effect:
             {monthly_seasonality_str}
-            
-            위 데이터를 종합적으로 분석하여 다음을 작성해주세요:
-            1. 향후 {state["forecast_horizon_weeks"]}주 동안의 주요 매출 트렌드 예측
-            2. 카테고리별 성과 예측 및 성장 기회
-            3. 계절성 요소를 활용한 판매 전략 제안
-            4. 수요 예측에 따른 재고 관리 및 마케팅 제안
-            5. 예측 결과에 따른 리스크 요소 및 대응 방안
-            
-            각 항목은 데이터에 기반한 구체적인 인사이트와 함께 작성해주세요.
+
+            Based on the data above, please provide:
+
+            1. Key sales trend forecast for the next {state["forecast_horizon_weeks"]} weeks
+            2. Category performance forecast and growth opportunities
+            3. Sales strategy recommendations based on seasonality factors
+            4. Inventory management and marketing recommendations based on demand forecast
+            5. Risk factors and mitigation strategies based on forecast results
+
+            Please provide specific, data-driven insights for each item.
             """
             
             # Get insights from LLM
@@ -1133,22 +1076,22 @@ def report_generator(state: ForecastState) -> ForecastState:
             for line in lines:
                 line = line.strip()
                 if line and (line.startswith('1.') or line.startswith('2.') or 
-                          line.startswith('3.') or line.startswith('4.') or
-                          line.startswith('5.') or line.startswith('- ')):
+                             line.startswith('3.') or line.startswith('4.') or 
+                             line.startswith('5.') or line.startswith('- ')):
                     if current_insight:
                         insights.append(current_insight)
                     current_insight = line
                 elif line and current_insight:
                     current_insight += " " + line
-            
+                    
             if current_insight:
                 insights.append(current_insight)
-            
+                
             state["insights"] = insights
         
         # Create PDF report
         report = ReportPDF()
-        report.set_title("가전 리테일 CDP 수요 예측 리포트")
+        report.set_title("Electronics Retail CDP Demand Forecast Report")
         report.add_date()
         
         # Add executive summary
@@ -1156,39 +1099,39 @@ def report_generator(state: ForecastState) -> ForecastState:
         report.add_executive_summary(summary)
         
         # Add total forecast section
-        report.add_section("전체 매출 예측")
-        report.add_text(f"향후 {state['forecast_horizon_weeks']}주간의 총 매출액 예측 결과입니다. "
-                      f"예상 성장률은 {state['growth_rates']['total_growth_rate']:.2f}%입니다.")
+        report.add_section("Total Sales Forecast")
+        report.add_text(f"Forecast of total sales for the next {state['forecast_horizon_weeks']} weeks. "
+                       f"Expected growth rate: {state['growth_rates']['total_growth_rate']:.2f}%.")
         
         # Add total forecast visualization
-        total_viz = next((v for v in state["visualizations"] if "총 매출액" in v["title"]), None)
+        total_viz = next((v for v in state["visualizations"] if "Total Sales" in v["title"]), None)
         if total_viz:
             report.add_image(total_viz["path"], width=160, caption=total_viz["title"])
             report.add_text(total_viz["description"])
         
         # Add category forecasts section
-        report.add_section("카테고리별 예측")
-        report.add_text("주요 제품 카테고리별 매출액 예측 결과입니다.")
+        report.add_section("Category Forecasts")
+        report.add_text("Sales forecasts for major product categories.")
         
         # Add category forecast visualizations
         for viz in state["visualizations"]:
-            if "카테고리 매출액" in viz["title"]:
+            if "Category Sales" in viz["title"]:
                 report.add_image(viz["path"], width=160, caption=viz["title"])
                 report.add_text(viz["description"])
         
         # Add growth rate analysis section
-        report.add_section("성장률 분석")
-        report.add_text(f"향후 {state['forecast_horizon_weeks']}주간 예상되는 카테고리별 성장률입니다.")
+        report.add_section("Growth Rate Analysis")
+        report.add_text(f"Expected growth rates by category for the next {state['forecast_horizon_weeks']} weeks.")
         
         # Add growth rate visualization
-        growth_viz = next((v for v in state["visualizations"] if "성장률" in v["title"]), None)
+        growth_viz = next((v for v in state["visualizations"] if "Growth Rate" in v["title"]), None)
         if growth_viz:
             report.add_image(growth_viz["path"], width=160, caption=growth_viz["title"])
             report.add_text(growth_viz["description"])
         
         # Add seasonality analysis section
-        report.add_section("계절성 분석")
-        report.add_text("요일별, 월별 판매 패턴의 계절성을 분석한 결과입니다.")
+        report.add_section("Seasonality Analysis")
+        report.add_text("Analysis of seasonality patterns in daily and monthly sales.")
         
         # Add seasonality visualizations
         for viz_path in state["seasonality"]["visualization_paths"]:
@@ -1198,24 +1141,25 @@ def report_generator(state: ForecastState) -> ForecastState:
                 report.add_text(viz["description"])
         
         # Add insights section
-        report.add_section("예측 인사이트")
+        report.add_section("Forecast Insights")
         for insight in state["insights"]:
             report.add_text("• " + insight)
         
         # Add recommendations section
-        report.add_section("권장 사항")
-        report.add_text("수요 예측 결과를 활용하여 다음과 같은 방안을 추진하는 것이 권장됩니다:")
+        report.add_section("Recommendations")
+        report.add_text("Based on the forecast results, the following actions are recommended:")
         
         # Extract recommendations from insights
-        recommendations = [insight for insight in state["insights"] if "제안" in insight or "권장" in insight or "전략" in insight]
+        recommendations = [insight for insight in state["insights"] if "recommend" in insight.lower() or "suggest" in insight.lower() or "strategy" in insight.lower()]
+        
         if recommendations:
             for rec in recommendations:
                 report.add_text("• " + rec)
         else:
-            report.add_text("• 성장이 예상되는 카테고리에 대한 재고 및 판촉 강화")
-            report.add_text("• 계절성이 강한 제품에 대한 시즌별 프로모션 계획 수립")
-            report.add_text("• 요일별 수요 패턴에 맞춘 인력 배치 및 마케팅 타이밍 조절")
-            report.add_text("• 수요가 감소할 것으로 예상되는 카테고리의 재고 관리 최적화")
+            report.add_text("• Increase inventory and promotions for categories with expected growth")
+            report.add_text("• Develop seasonal promotions for products with strong seasonality")
+            report.add_text("• Adjust staffing and marketing timing based on daily demand patterns")
+            report.add_text("• Optimize inventory management for categories with expected declining demand")
         
         # Generate and save the report
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1235,9 +1179,9 @@ def report_generator(state: ForecastState) -> ForecastState:
         
     except Exception as e:
         logger.error(f"Report Generator: Error generating report - {str(e)}")
-        state["error"] = f"리포트 생성 중 오류 발생: {str(e)}"
+        state["error"] = f"Error generating report: {str(e)}"
         state["next_agent"] = END
-    
+        
     return state
 
 # Define the routing logic for the graph
@@ -1253,7 +1197,7 @@ def router(state: ForecastState) -> str:
     """
     if state.get("error"):
         return END
-    
+        
     return state.get("next_agent", END)
 
 # Build the graph

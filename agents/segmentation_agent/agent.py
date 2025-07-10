@@ -166,6 +166,7 @@ class SegmentationAgent:
         3. 쿼리 결과는 고객 ID(customer_id)와 관련 속성을 포함해야 합니다.
         4. 가능하면 세그먼트 이름이나 레이블을 포함하는 열을 생성해주세요.
         5. 쿼리 설명이나 주석 없이 SQL 쿼리만 제공해주세요.
+        6. yyyy-mm-dd 형태의 날짜나, timestamp처럼 보이는 컬럼들은 현재 STRING 타입입니다. 불필요한 PARSE_DATE를 하지 마세요.
         """
         
         # Get SQL from LLM
@@ -179,6 +180,8 @@ class SegmentationAgent:
             sql_query = sql_query.split("```")[0]
         
         sql_query = sql_query.strip()
+        
+        print(sql_query)
         
         # Store the query
         self.queries[text_request] = sql_query
@@ -316,9 +319,9 @@ class SegmentationAgent:
                 c.customer_id,
                 c.registration_date,
                 DATETIME_DIFF(CURRENT_DATETIME(), PARSE_DATETIME('%Y-%m-%d', c.registration_date), DAY) as days_since_registration,
-                MAX(PARSE_DATETIME('%Y-%m-%d %H:%M:%S', t.transaction_date)) as last_purchase_date,
+                DATE_DIFF(CURRENT_DATE(), PARSE_DATE('%Y-%m-%d', c.registration_date), DAY) as days_since_registration,
                 DATETIME_DIFF(CURRENT_DATETIME(), MAX(PARSE_DATETIME('%Y-%m-%d %H:%M:%S', t.transaction_date)), DAY) as days_since_last_purchase,
-                COUNT(DISTINCT t.transaction_id) as purchase_count,
+                DATE_DIFF(CURRENT_DATE(), DATE(MAX(PARSE_DATETIME('%Y-%m-%d %H:%M:%S', t.transaction_date))), DAY) as days_since_last_purchase,
                 COUNT(DISTINCT ob.session_id) as online_sessions
             FROM
                 `{self.dataset_id}.customer_master` c

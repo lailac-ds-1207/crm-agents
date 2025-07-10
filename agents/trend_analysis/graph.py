@@ -1,21 +1,27 @@
 """
 LangGraph-based workflow definition for the Trend Analysis Agent.
+
 This module defines the graph structure and flow for trend analysis.
 """
+
 from typing import Dict, List, Any, TypedDict, Optional, Annotated, Literal
 import os
 from pathlib import Path
 import logging
 from datetime import datetime, timedelta
-
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
-
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 import config
 from utils.bigquery import BigQueryConnector
+from utils.visualization import (
+    create_time_series_plot, create_bar_chart, create_pie_chart,
+    create_heatmap, save_matplotlib_fig
+)
 
 # Configure logging
 logging.basicConfig(
@@ -70,7 +76,6 @@ def get_llm():
     )
 
 # Define the sub-agent functions
-
 def data_collector(state: TrendAnalysisState) -> TrendAnalysisState:
     """
     Collect data from BigQuery for trend analysis.
@@ -151,9 +156,9 @@ def data_collector(state: TrendAnalysisState) -> TrendAnalysisState:
         
     except Exception as e:
         logger.error(f"Data Collector: Error collecting data - {str(e)}")
-        state["error"] = f"데이터 수집 중 오류 발생: {str(e)}"
+        state["error"] = f"Error collecting data: {str(e)}"
         state["next_agent"] = END
-    
+        
     return state
 
 def category_analyzer(state: TrendAnalysisState) -> TrendAnalysisState:
@@ -207,7 +212,7 @@ def category_analyzer(state: TrendAnalysisState) -> TrendAnalysisState:
         second_half_sales = second_half_sales.rename(columns={"total_amount": "second_half_sales"})
         
         category_growth = first_half_sales.merge(second_half_sales, on="category_level_1", how="outer").fillna(0)
-        category_growth["growth_rate"] = ((category_growth["second_half_sales"] - category_growth["first_half_sales"]) / 
+        category_growth["growth_rate"] = ((category_growth["second_half_sales"] - category_growth["first_half_sales"]) /
                                         category_growth["first_half_sales"] * 100).fillna(0)
         
         # 3. Subcategory analysis
@@ -250,9 +255,9 @@ def category_analyzer(state: TrendAnalysisState) -> TrendAnalysisState:
         
     except Exception as e:
         logger.error(f"Category Analyzer: Error analyzing categories - {str(e)}")
-        state["error"] = f"카테고리 분석 중 오류 발생: {str(e)}"
+        state["error"] = f"Error analyzing categories: {str(e)}"
         state["next_agent"] = END
-    
+        
     return state
 
 def channel_analyzer(state: TrendAnalysisState) -> TrendAnalysisState:
@@ -273,7 +278,7 @@ def channel_analyzer(state: TrendAnalysisState) -> TrendAnalysisState:
         online_behavior_data = state["online_behavior_data"]["df"]
         
         # Extract online purchases
-        online_purchases = online_behavior_data[online_behavior_data["event_type"] == "구매완료"]
+        online_purchases = online_behavior_data[online_behavior_data["event_type"] == "Purchase Complete"]
         
         # Prepare data for comparison
         # Note: In real implementation, we would need to handle the mapping between
@@ -311,7 +316,7 @@ def channel_analyzer(state: TrendAnalysisState) -> TrendAnalysisState:
         
         # Online to offline conversion analysis
         # This is a simplified version - in reality would need more complex logic
-        online_product_views = online_behavior_data[online_behavior_data["event_type"] == "제품뷰"]
+        online_product_views = online_behavior_data[online_behavior_data["event_type"] == "Product View"]
         
         # Store analysis results in state
         state["channel_analysis"] = {
@@ -332,9 +337,9 @@ def channel_analyzer(state: TrendAnalysisState) -> TrendAnalysisState:
         
     except Exception as e:
         logger.error(f"Channel Analyzer: Error analyzing channels - {str(e)}")
-        state["error"] = f"채널 분석 중 오류 발생: {str(e)}"
+        state["error"] = f"Error analyzing channels: {str(e)}"
         state["next_agent"] = END
-    
+        
     return state
 
 def customer_analyzer(state: TrendAnalysisState) -> TrendAnalysisState:
@@ -437,9 +442,9 @@ def customer_analyzer(state: TrendAnalysisState) -> TrendAnalysisState:
         
     except Exception as e:
         logger.error(f"Customer Analyzer: Error analyzing customers - {str(e)}")
-        state["error"] = f"고객 분석 중 오류 발생: {str(e)}"
+        state["error"] = f"Error analyzing customers: {str(e)}"
         state["next_agent"] = END
-    
+        
     return state
 
 def trend_visualizer(state: TrendAnalysisState) -> TrendAnalysisState:
@@ -455,119 +460,170 @@ def trend_visualizer(state: TrendAnalysisState) -> TrendAnalysisState:
     logger.info("Trend Visualizer: Creating visualizations")
     
     try:
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        import plotly.express as px
-        from utils.visualization import (
-            create_time_series_plot, create_bar_chart, create_pie_chart,
-            create_heatmap, save_plotly_fig, save_matplotlib_fig
-        )
-        
         visualizations = []
         
         # 1. Category Sales Visualization
-        category_sales = state["category_analysis"]["category_sales"]
+        category_sales = state["category_analysis"]["category_sales"].copy()
+        # Convert to proper data types to avoid dtype errors
+        category_sales['category_level_1'] = category_sales['category_level_1'].astype(str)
+        category_sales['sales_amount'] = pd.to_numeric(category_sales['sales_amount'], errors='coerce')
+        category_sales['transaction_count'] = pd.to_numeric(category_sales['transaction_count'], errors='coerce')
+        category_sales['quantity'] = pd.to_numeric(category_sales['quantity'], errors='coerce')
+        
+        # Create a clean DataFrame with only the needed columns
+        plot_df = pd.DataFrame({
+            'category_level_1': category_sales['category_level_1'],
+            'sales_amount': category_sales['sales_amount']
+        })
+        
         fig = create_bar_chart(
-            category_sales,
+            plot_df,
             x_column="category_level_1",
             y_column="sales_amount",
-            title="카테고리별 매출액",
-            use_plotly=True
+            title="Sales by Category"
         )
-        viz_path = save_plotly_fig(fig, "category_sales.png")
+        
+        viz_path = save_matplotlib_fig(fig, "category_sales.png")
         visualizations.append({
             "path": viz_path,
-            "title": "카테고리별 매출액",
-            "description": "각 제품 카테고리별 총 매출액을 보여주는 차트입니다."
+            "title": "Sales by Category",
+            "description": "Chart showing total sales amount for each product category."
         })
-
         
         # 2. Category Growth Visualization
-        category_growth = state["category_analysis"]["category_growth"]
+        category_growth = state["category_analysis"]["category_growth"].copy()
+        # Convert to proper data types
+        category_growth['category_level_1'] = category_growth['category_level_1'].astype(str)
+        category_growth['growth_rate'] = pd.to_numeric(category_growth['growth_rate'], errors='coerce')
+        category_growth['first_half_sales'] = pd.to_numeric(category_growth['first_half_sales'], errors='coerce')
+        category_growth['second_half_sales'] = pd.to_numeric(category_growth['second_half_sales'], errors='coerce')
+        
+        # Create a clean DataFrame with only the needed columns
+        plot_df = pd.DataFrame({
+            'category_level_1': category_growth['category_level_1'],
+            'growth_rate': category_growth['growth_rate']
+        })
+        
         fig = create_bar_chart(
-            category_growth,
+            plot_df,
             x_column="category_level_1",
             y_column="growth_rate",
-            title="카테고리별 성장률",
-            use_plotly=True
+            title="Growth Rate by Category"
         )
-        viz_path = save_plotly_fig(fig, "category_growth.png")
+        
+        viz_path = save_matplotlib_fig(fig, "category_growth.png")
         visualizations.append({
             "path": viz_path,
-            "title": "카테고리별 성장률",
-            "description": "각 제품 카테고리의 성장률을 보여주는 차트입니다."
+            "title": "Growth Rate by Category",
+            "description": "Chart showing growth rate for each product category."
         })
         
         # 3. Online vs Offline Channel Comparison
-        offline_sales = state["channel_analysis"]["offline_sales_by_date"]
-        online_events = state["channel_analysis"]["online_events_by_date"]
+        offline_sales = state["channel_analysis"]["offline_sales_by_date"].copy()
+        # Convert to proper data types
+        offline_sales['date'] = pd.to_datetime(offline_sales['date'])
+        offline_sales['sales_amount'] = pd.to_numeric(offline_sales['sales_amount'], errors='coerce')
+        offline_sales['transaction_count'] = pd.to_numeric(offline_sales['transaction_count'], errors='coerce')
+        
+        # Create a clean DataFrame with only the needed columns
+        plot_df = pd.DataFrame({
+            'date': offline_sales['date'],
+            'sales_amount': offline_sales['sales_amount']
+        })
         
         # Create a time series plot for offline sales
         fig = create_time_series_plot(
-            offline_sales,
+            plot_df,
             x_column="date",
-            y_column="sales_amount",
-            title="오프라인 일별 매출 추이",
-            use_plotly=True
+            y_columns="sales_amount",
+            title="Daily Offline Sales Trend"
         )
-        viz_path = save_plotly_fig(fig, "offline_sales_trend.png")
+        
+        viz_path = save_matplotlib_fig(fig, "offline_sales_trend.png")
         visualizations.append({
             "path": viz_path,
-            "title": "오프라인 일별 매출 추이",
-            "description": "오프라인 채널의 일별 매출 추이를 보여주는 차트입니다."
+            "title": "Daily Offline Sales Trend",
+            "description": "Chart showing daily sales trend for offline channel."
         })
         
         # 4. Customer Segment Analysis
-        segment_analysis = state["customer_analysis"]["segment_analysis"]
+        segment_analysis = state["customer_analysis"]["segment_analysis"].copy()
+        # Convert sales_amount to numeric
+        segment_analysis['sales_amount'] = pd.to_numeric(segment_analysis['sales_amount'], errors='coerce')
+        
+        # Create pivot table
         pivot_df = segment_analysis.pivot_table(
-            index="life_stage", 
-            columns="gender", 
+            index="life_stage",
+            columns="gender",
             values="sales_amount",
             aggfunc="sum"
         ).fillna(0)
         
+        # Convert all values to numeric
+        pivot_df = pivot_df.astype(float)
+        
         fig = create_heatmap(
             pivot_df,
-            title="라이프스테이지 및 성별에 따른 매출액",
-            use_plotly=True
+            title="Sales by Life Stage and Gender"
         )
-        viz_path = save_plotly_fig(fig, "segment_heatmap.png")
+        
+        viz_path = save_matplotlib_fig(fig, "segment_heatmap.png")
         visualizations.append({
             "path": viz_path,
-            "title": "라이프스테이지 및 성별에 따른 매출액",
-            "description": "고객의 라이프스테이지와 성별에 따른 매출액 분포를 보여주는 히트맵입니다."
+            "title": "Sales by Life Stage and Gender",
+            "description": "Heatmap showing sales distribution by customer life stage and gender."
         })
-
+        
         # 5. Age Group Analysis
-        age_group_analysis = state["customer_analysis"]["age_group_analysis"]
+        age_group_analysis = state["customer_analysis"]["age_group_analysis"].copy()
+        # Convert to proper data types
+        age_group_analysis['age_group'] = age_group_analysis['age_group'].astype(str)
+        age_group_analysis['sales_amount'] = pd.to_numeric(age_group_analysis['sales_amount'], errors='coerce')
+        
+        # Create a clean DataFrame with only the needed columns
+        plot_df = pd.DataFrame({
+            'age_group': age_group_analysis['age_group'],
+            'sales_amount': age_group_analysis['sales_amount']
+        })
+        
         fig = create_bar_chart(
-            age_group_analysis,
+            plot_df,
             x_column="age_group",
             y_column="sales_amount",
-            title="연령대별 매출액",
-            use_plotly=True
+            title="Sales by Age Group"
         )
-        viz_path = save_plotly_fig(fig, "age_group_sales.png")
+        
+        viz_path = save_matplotlib_fig(fig, "age_group_sales.png")
         visualizations.append({
             "path": viz_path,
-            "title": "연령대별 매출액",
-            "description": "고객 연령대별 총 매출액을 보여주는 차트입니다."
+            "title": "Sales by Age Group",
+            "description": "Chart showing total sales amount by customer age group."
         })
-
+        
         # 6. Region Analysis
-        region_analysis = state["customer_analysis"]["region_analysis"]
+        region_analysis = state["customer_analysis"]["region_analysis"].copy()
+        # Convert to proper data types
+        region_analysis['region'] = region_analysis['region'].astype(str)
+        region_analysis['sales_amount'] = pd.to_numeric(region_analysis['sales_amount'], errors='coerce')
+        
+        # Create a clean DataFrame with only the needed columns
+        plot_df = pd.DataFrame({
+            'region': region_analysis['region'],
+            'sales_amount': region_analysis['sales_amount']
+        })
+        
         fig = create_pie_chart(
-            region_analysis,
+            plot_df,
             values_column="sales_amount",
             names_column="region",
-            title="지역별 매출 비중",
-            use_plotly=True
+            title="Sales Distribution by Region"
         )
-        viz_path = save_plotly_fig(fig, "region_sales.png")
+        
+        viz_path = save_matplotlib_fig(fig, "region_sales.png")
         visualizations.append({
             "path": viz_path,
-            "title": "지역별 매출 비중",
-            "description": "지역별 매출 비중을 보여주는 파이 차트입니다."
+            "title": "Sales Distribution by Region",
+            "description": "Pie chart showing sales distribution by region."
         })
         
         # Store visualization paths in state
@@ -582,9 +638,9 @@ def trend_visualizer(state: TrendAnalysisState) -> TrendAnalysisState:
         
     except Exception as e:
         logger.error(f"Trend Visualizer: Error creating visualizations - {str(e)}")
-        state["error"] = f"시각화 생성 중 오류 발생: {str(e)}"
+        state["error"] = f"Error creating visualizations: {str(e)}"
         state["next_agent"] = END
-    
+        
     return state
 
 def report_generator(state: TrendAnalysisState) -> TrendAnalysisState:
@@ -622,31 +678,35 @@ def report_generator(state: TrendAnalysisState) -> TrendAnalysisState:
             segment_analysis_str = customer_analysis["segment_analysis"].to_string()
             
             prompt = f"""
-            당신은 가전 리테일 업체의 데이터 분석가입니다. 다음 분석 결과를 검토하고 주요 트렌드와 인사이트를 도출해주세요.
-            
-            ## 카테고리 분석
-            카테고리별 매출:
+            You are a data analyst for an electronics retail company. Please review the following analysis results and identify key trends and insights.
+
+            ## Category Analysis
+
+            Category Sales:
             {category_sales_str}
-            
-            카테고리별 성장률:
+
+            Category Growth Rates:
             {category_growth_str}
-            
-            ## 채널 분석
-            오프라인 거래 수: {channel_analysis["offline_transaction_count"]}
-            온라인 이벤트 수: {channel_analysis["online_event_count"]}
-            온라인 구매 수: {channel_analysis["online_purchase_count"]}
-            
-            ## 고객 분석
-            세그먼트별 분석:
+
+            ## Channel Analysis
+
+            Offline Transaction Count: {channel_analysis["offline_transaction_count"]}
+            Online Event Count: {channel_analysis["online_event_count"]}
+            Online Purchase Count: {channel_analysis["online_purchase_count"]}
+
+            ## Customer Analysis
+
+            Segment Analysis:
             {segment_analysis_str}
-            
-            위 데이터를 기반으로 다음을 작성해주세요:
-            1. 주요 트렌드 5가지
-            2. 비즈니스 기회 3가지
-            3. 개선이 필요한 영역 2가지
-            4. 마케팅 전략 제안 3가지
-            
-            각 항목은 데이터에 기반한 구체적인 인사이트와 함께 작성해주세요.
+
+            Based on the data above, please provide:
+
+            1. Five key trends
+            2. Three business opportunities
+            3. Two areas needing improvement
+            4. Three marketing strategy recommendations
+
+            Please provide specific, data-driven insights for each item.
             """
             
             # Get insights from LLM
@@ -660,23 +720,23 @@ def report_generator(state: TrendAnalysisState) -> TrendAnalysisState:
             
             for line in lines:
                 line = line.strip()
-                if line and (line.startswith('1.') or line.startswith('2.') or 
-                          line.startswith('3.') or line.startswith('4.') or
-                          line.startswith('5.') or line.startswith('- ')):
+                if line and (line.startswith('1.') or line.startswith('2.') or
+                             line.startswith('3.') or line.startswith('4.') or
+                             line.startswith('5.') or line.startswith('- ')):
                     if current_insight:
                         insights.append(current_insight)
                     current_insight = line
                 elif line and current_insight:
                     current_insight += " " + line
-            
+                    
             if current_insight:
                 insights.append(current_insight)
-            
+                
             state["insights"] = insights
         
         # Create PDF report
         report = ReportPDF()
-        report.set_title("가전 리테일 CDP 트렌드 분석 리포트")
+        report.set_title("Electronics Retail CDP Trend Analysis Report")
         report.add_date()
         
         # Add executive summary
@@ -684,8 +744,8 @@ def report_generator(state: TrendAnalysisState) -> TrendAnalysisState:
         report.add_executive_summary(summary)
         
         # Add category analysis section
-        report.add_section("카테고리 분석")
-        report.add_text("제품 카테고리별 판매 트렌드와 성장률 분석 결과입니다.")
+        report.add_section("Category Analysis")
+        report.add_text("Analysis of product category sales trends and growth rates.")
         
         # Add category visualizations
         for viz in state["visualizations"]:
@@ -694,8 +754,8 @@ def report_generator(state: TrendAnalysisState) -> TrendAnalysisState:
                 report.add_text(viz["description"])
         
         # Add channel analysis section
-        report.add_section("채널 분석")
-        report.add_text("온라인과 오프라인 채널의 성과 비교 분석 결과입니다.")
+        report.add_section("Channel Analysis")
+        report.add_text("Comparison of online and offline channel performance.")
         
         # Add channel visualizations
         for viz in state["visualizations"]:
@@ -704,8 +764,8 @@ def report_generator(state: TrendAnalysisState) -> TrendAnalysisState:
                 report.add_text(viz["description"])
         
         # Add customer analysis section
-        report.add_section("고객 분석")
-        report.add_text("고객 세그먼트별 구매 패턴과 선호도 분석 결과입니다.")
+        report.add_section("Customer Analysis")
+        report.add_text("Analysis of customer segments and purchasing patterns.")
         
         # Add customer visualizations
         for viz in state["visualizations"]:
@@ -714,23 +774,24 @@ def report_generator(state: TrendAnalysisState) -> TrendAnalysisState:
                 report.add_text(viz["description"])
         
         # Add insights section
-        report.add_section("주요 인사이트")
+        report.add_section("Key Insights")
         for insight in state["insights"]:
-            report.add_text("• " + insight)
+            report.add_text("- " + insight)
         
         # Add recommendations section
-        report.add_section("권장 사항")
-        report.add_text("분석 결과를 바탕으로 다음과 같은 조치를 권장합니다:")
+        report.add_section("Recommendations")
+        report.add_text("Based on the analysis, the following actions are recommended:")
         
         # Extract recommendations from insights
-        recommendations = [insight for insight in state["insights"] if "제안" in insight or "권장" in insight]
+        recommendations = [insight for insight in state["insights"] if "recommend" in insight.lower() or "suggest" in insight.lower()]
+        
         if recommendations:
             for rec in recommendations:
-                report.add_text("• " + rec)
+                report.add_text("- " + rec)
         else:
-            report.add_text("• 성장률이 높은 카테고리에 대한 마케팅 강화")
-            report.add_text("• 고객 세그먼트별 맞춤형 프로모션 개발")
-            report.add_text("• 온/오프라인 채널 간의 시너지 강화 전략 수립")
+            report.add_text("- Strengthen marketing for high-growth categories")
+            report.add_text("- Develop personalized promotions for different customer segments")
+            report.add_text("- Enhance synergy between online and offline channels")
         
         # Generate and save the report
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -750,9 +811,9 @@ def report_generator(state: TrendAnalysisState) -> TrendAnalysisState:
         
     except Exception as e:
         logger.error(f"Report Generator: Error generating report - {str(e)}")
-        state["error"] = f"리포트 생성 중 오류 발생: {str(e)}"
+        state["error"] = f"Error generating report: {str(e)}"
         state["next_agent"] = END
-    
+        
     return state
 
 # Define the routing logic for the graph
@@ -768,7 +829,7 @@ def router(state: TrendAnalysisState) -> str:
     """
     if state.get("error"):
         return END
-    
+        
     return state.get("next_agent", END)
 
 # Build the graph

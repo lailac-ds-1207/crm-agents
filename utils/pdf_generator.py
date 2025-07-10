@@ -31,8 +31,8 @@ PAGE_HEIGHT = 297  # A4 height in mm
 MARGIN = 10  # margin in mm
 
 # Font settings
-FONT_FAMILY_MAIN = 'Arial'
-FONT_FAMILY_HEADING = 'Arial'
+FONT_FAMILY_MAIN = 'NotoSansKR'
+FONT_FAMILY_HEADING = 'NotoSansKR'
 FONT_SIZE_TITLE = 24
 FONT_SIZE_HEADING1 = 18
 FONT_SIZE_HEADING2 = 16
@@ -63,25 +63,28 @@ class ReportPDF(FPDF):
         """
         super().__init__(orientation=orientation, unit=unit, format=format)
         
+        # Windows 시스템 폰트 경로 예시
+        # 보통 NotoSansKR에는 Italic이 따로 없기 때문에, Regular을 재사용
+        self.add_font('NotoSansKR', '', r"C:/Windows/Fonts/NotoSansKR-VF.ttf", uni=True)
+        self.add_font('NotoSansKR', 'B', r"C:/Windows/Fonts/NotoSansKR-VF.ttf", uni=True)  # Bold 대체
+        self.add_font('NotoSansKR', 'I', r"C:/Windows/Fonts/NotoSansKR-VF.ttf", uni=True)  # Italic 대체
+        self.add_font('NotoSansKR', 'BI', r"C:/Windows/Fonts/NotoSansKR-VF.ttf", uni=True) # BoldItalic 대체
+        # 기본 폰트를 NotoSansKR로 변경
+        self.set_font('NotoSansKR','', FONT_SIZE_NORMAL)
+        
         # Initialize document properties
         self.set_margins(MARGIN, MARGIN, MARGIN)
         self.set_auto_page_break(True, margin=MARGIN)
         
-        # Add fonts
-        self.add_font('Arial', '', 'Arial', uni=True)
-        self.add_font('Arial', 'B', 'Arial Bold', uni=True)
-        self.add_font('Arial', 'I', 'Arial Italic', uni=True)
-        self.add_font('Arial', 'BI', 'Arial Bold Italic', uni=True)
-        
-        # Set default font
-        self.set_font(FONT_FAMILY_MAIN, '', FONT_SIZE_NORMAL)
+        # Set default font - using built-in fonts instead of custom fonts
+        # self.set_font(FONT_FAMILY_MAIN, '', FONT_SIZE_NORMAL)
         
         # Initialize document
         self.alias_nb_pages()  # For page numbers
         self.add_page()
         
         # Set document properties
-        self.set_title("CDP 분석 리포트")
+        self.set_title("CDP Analysis Report")
         self.set_author("AI CRM Agent")
         self.set_creator("CDP AI Agent System")
         
@@ -101,7 +104,7 @@ class ReportPDF(FPDF):
         self.set_text_color(*COLOR_SUBHEADING)
         
         # Add header text
-        self.cell(0, 10, "CDP AI Agent 분석 리포트", 0, 0, 'L')
+        self.cell(0, 10, "CDP AI Agent Analysis Report", 0, 0, 'L')
         
         # Add date on the right
         self.cell(0, 10, datetime.now().strftime("%Y-%m-%d"), 0, 0, 'R')
@@ -125,7 +128,7 @@ class ReportPDF(FPDF):
         self.set_text_color(*COLOR_SUBHEADING)
         
         # Add page number
-        self.cell(0, 10, f'페이지 {self.page_no()}/{{nb}}', 0, 0, 'C')
+        self.cell(0, 10, f'Page {self.page_no()}/{{nb}}', 0, 0, 'C')
     
     def set_title(self, title):
         """
@@ -155,7 +158,7 @@ class ReportPDF(FPDF):
         self.set_text_color(*COLOR_SUBHEADING)
         
         # Add date
-        self.cell(0, 10, f"생성일: {datetime.now().strftime('%Y년 %m월 %d일')}", 0, 1, 'C')
+        self.cell(0, 10, f"Generated: {datetime.now().strftime('%Y-%m-%d')}", 0, 1, 'C')
         self.ln(5)
         
         # Reset text color
@@ -302,7 +305,8 @@ class ReportPDF(FPDF):
                 self.add_page()
             
             # Add bullet point
-            self.cell(5, 6, '•', 0, 0, 'L')
+            # Use simple ASCII dash instead of a Unicode bullet to ensure font support
+            self.cell(5, 6, '-', 0, 0, 'L')
             self.multi_cell(0, 6, item)
             self.ln(1)
         
@@ -521,8 +525,8 @@ class ReportPDF(FPDF):
         """Add a table of contents placeholder (to be filled later)."""
         # This is a placeholder - TOC generation requires a two-pass approach
         # which is not implemented in this basic version
-        self.add_section("목차")
-        self.add_text("(목차는 자동으로 생성됩니다)")
+        self.add_section("Table of Contents")
+        self.add_text("(Table of contents will be generated automatically)")
         self.ln(10)
     
     def add_executive_summary(self, summary_text):
@@ -532,7 +536,7 @@ class ReportPDF(FPDF):
         Args:
             summary_text: Executive summary text
         """
-        self.add_section("요약")
+        self.add_section("Executive Summary")
         
         # Add a box around the summary
         self.set_fill_color(245, 245, 245)  # Light gray background
@@ -600,7 +604,8 @@ class ReportPDF(FPDF):
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         
         # Output PDF
-        self.output(dest)
+        # Call the parent FPDF.output to avoid infinite recursion
+        super().output(dest)
         logger.info(f"PDF report saved to {dest}")
         
         return dest
@@ -645,7 +650,7 @@ class ReportGenerator:
         pdf.add_executive_summary(executive_summary)
         
         # Add trend analysis section
-        pdf.add_section("트렌드 분석")
+        pdf.add_section("Trend Analysis")
         
         # Add trend data and visualizations
         for key, data in trend_data.items():
@@ -657,11 +662,11 @@ class ReportGenerator:
                 pdf.add_image(data['visualization'], width=160, caption=data['caption'])
         
         # Add insights section
-        pdf.add_section("주요 인사이트")
+        pdf.add_section("Key Insights")
         pdf.add_bullet_list(insights)
         
         # Add recommendations section
-        pdf.add_section("추천 사항")
+        pdf.add_section("Recommendations")
         pdf.add_numbered_list(recommendations)
         
         # Generate and save the report
@@ -703,7 +708,7 @@ class ReportGenerator:
         pdf.add_executive_summary(executive_summary)
         
         # Add forecast section
-        pdf.add_section("수요 예측")
+        pdf.add_section("Demand Forecast")
         
         # Add forecast data and visualizations
         for key, data in forecast_data.items():
@@ -715,11 +720,11 @@ class ReportGenerator:
                 pdf.add_image(data['visualization'], width=160, caption=data['caption'])
         
         # Add insights section
-        pdf.add_section("예측 인사이트")
+        pdf.add_section("Forecast Insights")
         pdf.add_bullet_list(insights)
         
         # Add recommendations section
-        pdf.add_section("권장 조치")
+        pdf.add_section("Recommended Actions")
         pdf.add_numbered_list(recommendations)
         
         # Generate and save the report
@@ -761,43 +766,43 @@ class ReportGenerator:
         pdf.add_executive_summary(executive_summary)
         
         # Add business analysis section
-        pdf.add_section("비즈니스 분석")
+        pdf.add_section("Business Analysis")
         
         # Add strengths subsection
-        pdf.add_subsection("비즈니스 강점")
+        pdf.add_subsection("Business Strengths")
         for strength in strengths:
             pdf.add_subsubsection(strength['description'])
-            pdf.add_text(f"관련 카테고리: {', '.join(strength['related_categories'])}")
-            pdf.add_text(f"근거 데이터: {strength['supporting_data']}")
-            pdf.add_text(f"비즈니스 기회: {strength['opportunity']}")
+            pdf.add_text(f"Related Categories: {', '.join(strength['related_categories'])}")
+            pdf.add_text(f"Supporting Data: {strength['supporting_data']}")
+            pdf.add_text(f"Business Opportunity: {strength['opportunity']}")
             pdf.ln(3)
         
         # Add weaknesses subsection
-        pdf.add_subsection("비즈니스 약점")
+        pdf.add_subsection("Business Weaknesses")
         for weakness in weaknesses:
             pdf.add_subsubsection(weakness['description'])
-            pdf.add_text(f"관련 카테고리: {', '.join(weakness['related_categories'])}")
-            pdf.add_text(f"근거 데이터: {weakness['supporting_data']}")
-            pdf.add_text(f"개선 전략: {weakness['mitigation_strategy']}")
+            pdf.add_text(f"Related Categories: {', '.join(weakness['related_categories'])}")
+            pdf.add_text(f"Supporting Data: {weakness['supporting_data']}")
+            pdf.add_text(f"Mitigation Strategy: {weakness['mitigation_strategy']}")
             pdf.ln(3)
         
         # Add selected campaigns section
-        pdf.add_section("선정된 캠페인")
+        pdf.add_section("Selected Campaigns")
         
         # Add each campaign
         for i, campaign in enumerate(campaigns, 1):
             pdf.add_subsection(f"{i}. {campaign['campaign_name']}")
-            pdf.add_text(f"유형: {campaign['campaign_type']}")
-            pdf.add_text(f"대상 카테고리: {', '.join(campaign['target_categories'])}")
-            pdf.add_text(f"설명: {campaign['description']}")
-            pdf.add_text(f"선정 이유: {campaign['rationale']}")
-            pdf.add_text(f"예상 효과: {campaign['expected_impact']}")
-            pdf.add_text(f"KPI: {', '.join(campaign['kpis'])}")
-            pdf.add_text(f"우선순위: {campaign['priority_score']}/10")
+            pdf.add_text(f"Type: {campaign['campaign_type']}")
+            pdf.add_text(f"Target Categories: {', '.join(campaign['target_categories'])}")
+            pdf.add_text(f"Description: {campaign['description']}")
+            pdf.add_text(f"Rationale: {campaign['rationale']}")
+            pdf.add_text(f"Expected Impact: {campaign['expected_impact']}")
+            pdf.add_text(f"KPIs: {', '.join(campaign['kpis'])}")
+            pdf.add_text(f"Priority Score: {campaign['priority_score']}/10")
             pdf.ln(5)
         
         # Add discussion summary section
-        pdf.add_section("의사결정 과정")
+        pdf.add_section("Decision Process")
         pdf.add_text(discussion_summary)
         
         # Generate and save the report
@@ -835,14 +840,14 @@ class ReportGenerator:
         pdf.add_executive_summary(executive_summary)
         
         # Add segmentation overview section
-        pdf.add_section("세그멘테이션 개요")
-        pdf.add_text("이 보고서는 선정된 캠페인에 대한 타겟 세그먼트를 정의하고 분석합니다.")
+        pdf.add_section("Segmentation Overview")
+        pdf.add_text("This report defines and analyzes target segments for the selected campaigns.")
         
         # Add campaign-segment mapping table
-        pdf.add_subsection("캠페인-세그먼트 매핑")
+        pdf.add_subsection("Campaign-Segment Mapping")
         
         # Create table data
-        headers = ["캠페인", "세그먼트", "고객 수", "예상 반응률"]
+        headers = ["Campaign", "Segment", "Customer Count", "Expected Response Rate"]
         data = []
         
         for segment in segments:
@@ -859,7 +864,7 @@ class ReportGenerator:
         pdf.add_table(headers, data)
         
         # Add detailed segments section
-        pdf.add_section("세그먼트 상세 분석")
+        pdf.add_section("Detailed Segment Analysis")
         
         # Add each segment
         for segment in segments:
@@ -867,30 +872,30 @@ class ReportGenerator:
             if not campaign:
                 continue
                 
-            pdf.add_subsection(f"{segment['segment_name']} (캠페인: {campaign['campaign_name']})")
+            pdf.add_subsection(f"{segment['segment_name']} (Campaign: {campaign['campaign_name']})")
             
             # Add segment definition
-            pdf.add_subsubsection("세그먼트 정의")
+            pdf.add_subsubsection("Segment Definition")
             pdf.add_text(segment['segment_definition'])
             
             # Add SQL query
-            pdf.add_subsubsection("SQL 쿼리")
+            pdf.add_subsubsection("SQL Query")
             pdf.add_text(segment['sql_query'])
             
             # Add segment statistics
-            pdf.add_subsubsection("세그먼트 통계")
-            pdf.add_text(f"고객 수: {segment['customer_count']}")
-            pdf.add_text(f"전체 고객 대비 비율: {segment['percentage_of_total']}%")
-            pdf.add_text(f"예상 반응률: {segment['expected_response_rate']}%")
+            pdf.add_subsubsection("Segment Statistics")
+            pdf.add_text(f"Customer Count: {segment['customer_count']}")
+            pdf.add_text(f"Percentage of Total: {segment['percentage_of_total']}%")
+            pdf.add_text(f"Expected Response Rate: {segment['expected_response_rate']}%")
             
             # Add segment characteristics
             if 'characteristics' in segment:
-                pdf.add_subsubsection("세그먼트 특성")
+                pdf.add_subsubsection("Segment Characteristics")
                 pdf.add_bullet_list(segment['characteristics'])
             
             # Add visualization if available
             if 'visualization' in segment:
-                pdf.add_image(segment['visualization'], width=160, caption=f"{segment['segment_name']} 세그먼트 분석")
+                pdf.add_image(segment['visualization'], width=160, caption=f"{segment['segment_name']} Segment Analysis")
             
             pdf.ln(5)
         
@@ -937,38 +942,38 @@ class ReportGenerator:
         pdf.add_executive_summary(executive_summary)
         
         # Add trend analysis summary
-        pdf.add_section("트렌드 분석 요약")
+        pdf.add_section("Trend Analysis Summary")
         pdf.add_text(trend_summary)
         
         # Add forecast summary
-        pdf.add_section("수요 예측 요약")
+        pdf.add_section("Demand Forecast Summary")
         pdf.add_text(forecast_summary)
         
         # Add campaign summary
-        pdf.add_section("선정된 캠페인 요약")
+        pdf.add_section("Selected Campaign Summary")
         
         # Add each campaign
         for i, campaign in enumerate(campaigns, 1):
             pdf.add_subsection(f"{i}. {campaign['campaign_name']}")
-            pdf.add_text(f"유형: {campaign['campaign_type']}")
-            pdf.add_text(f"설명: {campaign['description']}")
-            pdf.add_text(f"예상 효과: {campaign['expected_impact']}")
+            pdf.add_text(f"Type: {campaign['campaign_type']}")
+            pdf.add_text(f"Description: {campaign['description']}")
+            pdf.add_text(f"Expected Impact: {campaign['expected_impact']}")
             
             # Add related segment if available
             related_segments = [s for s in segments if s['campaign_id'] == campaign['campaign_id']]
             if related_segments:
                 for segment in related_segments:
-                    pdf.add_subsubsection(f"타겟 세그먼트: {segment['segment_name']}")
-                    pdf.add_text(f"고객 수: {segment['customer_count']}")
-                    pdf.add_text(f"예상 반응률: {segment['expected_response_rate']}%")
+                    pdf.add_subsubsection(f"Target Segment: {segment['segment_name']}")
+                    pdf.add_text(f"Customer Count: {segment['customer_count']}")
+                    pdf.add_text(f"Expected Response Rate: {segment['expected_response_rate']}%")
             
             pdf.ln(3)
         
         # Add segment analysis section
-        pdf.add_section("세그먼트 분석 요약")
+        pdf.add_section("Segment Analysis Summary")
         
         # Create table data
-        headers = ["세그먼트", "고객 수", "비율", "주요 특성"]
+        headers = ["Segment", "Customer Count", "Percentage", "Key Characteristic"]
         data = []
         
         for segment in segments:
@@ -986,24 +991,24 @@ class ReportGenerator:
         
         # Add visualizations if available
         if visualizations:
-            pdf.add_section("주요 시각화")
+            pdf.add_section("Key Visualizations")
             for i, viz_path in enumerate(visualizations):
                 if os.path.exists(viz_path):
-                    pdf.add_image(viz_path, width=160, caption=f"시각화 {i+1}")
+                    pdf.add_image(viz_path, width=160, caption=f"Visualization {i+1}")
         
         # Add recommendations section
-        pdf.add_section("최종 권장 사항")
+        pdf.add_section("Final Recommendations")
         pdf.add_numbered_list(recommendations)
         
         # Add next steps section
-        pdf.add_section("다음 단계")
-        pdf.add_text("이 보고서의 분석과 권장 사항을 바탕으로 다음 단계를 진행하시기 바랍니다:")
+        pdf.add_section("Next Steps")
+        pdf.add_text("Based on the analysis and recommendations in this report, please proceed with the following next steps:")
         pdf.add_bullet_list([
-            "캠페인 실행 계획 수립",
-            "세그먼트별 마케팅 메시지 개발",
-            "캠페인 성과 측정 지표 설정",
-            "실행 일정 및 담당자 지정",
-            "결과 모니터링 및 피드백 체계 구축"
+            "Develop campaign execution plan",
+            "Create segment-specific marketing messages",
+            "Set up campaign performance metrics",
+            "Establish execution timeline and responsibilities",
+            "Implement monitoring and feedback system"
         ])
         
         # Generate and save the report
